@@ -1,0 +1,2 @@
+2026-06-04 15:07:45.044163 [error] application: client-sample configured as routing but other routing manager present. Won't instantiate routing
+Couldn't initialize application

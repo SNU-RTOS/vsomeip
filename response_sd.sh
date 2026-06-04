@@ -1,1 +1,1 @@
-env VSOMEIP_CONFIGURATION=config/vsomeip-udp-service.json VSOMEIP_APPLICATION_NAME=service-sample build/examples/response-sd
+env LD_LIBRARY_PATH=build:$LD_LIBRARY_PATH VSOMEIP_CONFIGURATION=config/vsomeip-udp-service.json VSOMEIP_APPLICATION_NAME=service-sample build/examples/response-sd
