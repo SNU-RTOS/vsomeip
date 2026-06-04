@@ -137,8 +137,8 @@ public:
     void on_message(const std::shared_ptr<vsomeip::message> &_response)
     {
         finished_time = std::chrono::high_resolution_clock::now();
-        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(finished_time - started_time);
-        VSOMEIP_INFO << "TCP 통신 소요 시간: " << elapsed_ms.count() << "ms";
+        auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(finished_time - started_time);
+        VSOMEIP_INFO << "TCP 통신 소요 시간: " << elapsed_us.count() << "us";
         std::cout << "Received a response from Service ["
                   << std::setfill('0') << std::hex
                   << std::setw(4) << _response->get_service()

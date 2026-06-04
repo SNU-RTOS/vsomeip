@@ -23,8 +23,8 @@ do
         wait $PID 2>/dev/null
     fi
 
-    TIME=$(grep '매칭까지 처리 시간' temp_output.txt | awk -F' ' '{print $NF}' | tr -d 'ms')
-    echo "실행 횟수: $i, 처리 시간: $TIME ms"
+    TIME=$(grep '매칭까지 처리 시간' temp_output.txt | awk -F' ' '{print $NF}' | tr -d 'us')
+    echo "실행 횟수: $i, 처리 시간: $TIME us"
     if [[ -n $TIME ]]; then
         total_time=$(echo "$total_time + $TIME" | bc)
         ((count++))
@@ -33,7 +33,7 @@ done
 
 if [[ $count -gt 0 ]]; then
     average=$(echo "scale=2; $total_time / $count" | bc)
-    echo "평균 처리 시간: ${average}ms"
+    echo "평균 처리 시간: ${average}us"
 else
     echo "처리 시간을 계산할 수 없습니다."
 fi

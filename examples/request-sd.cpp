@@ -71,11 +71,11 @@ public:
         if (_is_available)
         {
             finished_time = std::chrono::high_resolution_clock::now();
-            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(finished_time - start_time);
+            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(finished_time - start_time);
             VSOMEIP_INFO << "matching is finished at: "
                          << std::chrono::duration_cast<std::chrono::microseconds>(finished_time.time_since_epoch()).count()
                          << " μs";
-            VSOMEIP_WARNING << "매칭까지 처리 시간: " << elapsed_ms.count() << "ms";
+            VSOMEIP_WARNING << "매칭까지 처리 시간: " << elapsed_us.count() << "us";
             std::cout << "Service ["
                       << std::setw(4) << std::setfill('0') << std::hex << _service << "." << _instance
                       << "] is available." << std::endl;
