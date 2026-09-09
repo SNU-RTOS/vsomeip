@@ -242,6 +242,28 @@ void routing_manager_impl::start() {
 
     if (stub_)
         stub_->start();
+
+#if defined(__linux__) || defined(ANDROID)
+    // VSOMEIP_SD_FAST_START: start IP routing (and with it service discovery)
+    // without waiting for the netlink interface/route dump to complete. The
+    // dump costs ~0.7ms, during which the application has already been told it
+    // is registered, so a request_service() issued from the state handler has
+    // to wait for SD to come up before its FindService can go out.
+    // Only safe when the configured unicast interface is known to be up at
+    // startup; netlink still runs and its routing_running_ guard keeps this
+    // from starting IP routing twice.
+    if (const char *its_fast_start = getenv("VSOMEIP_SD_FAST_START")) {
+        if (its_fast_start[0] == '1') {
+            std::lock_guard<std::mutex> its_lock(pending_sd_offers_mutex_);
+            if (!routing_running_) {
+                if_state_running_ = true;
+                sd_route_set_ = true;
+                start_ip_routing();
+            }
+        }
+    }
+#endif
+
     // 여기서 register가 되는군. 그러면 근데 network 세팅 이후 register 되는 게 맞지 않나? 저기는 말 그대로 핸들러 등록이고 실제 이벤트 발생 후에 갱신되는 게 아님
     host_->on_state(state_type_e::ST_REGISTERED);
     // start_ip_routing();
