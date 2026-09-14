@@ -5,15 +5,18 @@
 #ifndef VSOMEIP_ENABLE_SIGNAL_HANDLING
 #include <csignal>
 #endif
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 #include <vsomeip/vsomeip.hpp>
 #include <vsomeip/internal/logger.hpp>
@@ -34,17 +37,18 @@
 // `--threshold` times the configured `--cycle` as such a stall and logs the estimated
 // recovery time for it.
 //
-// `--cycle` and `--threshold` must describe the ACTUAL steady-state inter-arrival gap on
-// this link, not just the server's nominal --cycle: vsomeip's own TCP publish path only
-// delivers a roughly constant ~15% of whatever rate the server asks for (see
-// tcp-recovery/README.md "발행 주기가 왜 중요한가"), so the real gap is consistently
-// ~6.6-7x the server's --cycle argument, not equal to it. If this client's --cycle doesn't
-// match what the server was actually started with, the flagging threshold is checked
-// against the wrong baseline - too high a threshold (client thinks the cycle is longer
-// than it really is) silently swallows real losses instead of flagging them, and too low a
-// threshold (client thinks it's shorter) flags normal traffic as "loss". Always start from
-// a NO_DROP=1 baseline (see response_tcp.sh) at the exact --cycle you intend to use before
-// trusting flagged events.
+// The "normal gap" baseline is SELF-CALIBRATING, not assumed from --cycle: vsomeip's own
+// TCP publish path only delivers a roughly constant ~15% of whatever rate the server asks
+// for (see tcp-recovery/README.md "발행 주기가 왜 중요한가"), so the real steady-state gap
+// is consistently ~6.6-7x the server's --cycle argument, not equal to it - assuming
+// otherwise (an earlier version of this tool did) silently swallowed real losses whenever
+// this client's --cycle didn't happen to match what the server was actually started with.
+// Instead, `baseline_us()` tracks the median of the last kBaselineWindow gaps that weren't
+// themselves flagged as loss, and --cycle only seeds that estimate for the first
+// kMinBaselineSamples messages before real data takes over - so a --cycle that doesn't
+// match the server is no longer a correctness problem, just a slower warm-up. A
+// NO_DROP=1 baseline run (see response_tcp.sh) is still worth doing to sanity-check
+// --threshold, but is no longer required before trusting flagged events.
 //
 // This is an application-level estimate, not a wire-level measurement: besides the network
 // recovery time proper, it includes vsomeip's own receive-side processing (tens to a few
@@ -75,9 +79,10 @@ public:
             return false;
         }
         initialized_ = true;
-        std::cout << "TCP packet-recovery client: cycle=" << cycle_ << "ms, threshold="
-                  << threshold_ << "x (recovery flagged when a gap exceeds "
-                  << static_cast<uint32_t>(cycle_ * threshold_) << "ms)";
+        std::cout << "TCP packet-recovery client: threshold=" << threshold_
+                  << "x the observed normal gap (seeded from --cycle " << cycle_
+                  << "ms = " << (cycle_ * 1000) << "us until " << kMinBaselineSamples
+                  << " real samples arrive, then self-calibrating)";
         if (min_losses_ > 0)
             std::cout << ", stopping after " << min_losses_ << " flagged event(s)";
         std::cout << std::endl;
@@ -147,7 +152,7 @@ public:
         if (have_last_) {
             auto gap_us = std::chrono::duration_cast<std::chrono::microseconds>(
                     now - last_time_).count();
-            auto expected_us = static_cast<int64_t>(cycle_) * 1000;
+            int64_t base_us = baseline_us();
 
             if (seq != last_seq_ + 1) {
                 // Should not happen over TCP - flag it, but it is not the loss signal this
@@ -155,21 +160,28 @@ public:
                 std::cout << "[경고] 시퀀스 불연속: " << last_seq_ << " -> " << seq << std::endl;
             }
 
-            if (gap_us > static_cast<int64_t>(static_cast<double>(expected_us) * threshold_)) {
-                int64_t recovery_us = gap_us - expected_us;
+            if (gap_us > static_cast<int64_t>(static_cast<double>(base_us) * threshold_)) {
+                int64_t recovery_us = gap_us - base_us;
                 if (recovery_us < 0)
                     recovery_us = 0;
                 VSOMEIP_WARNING << "패킷 유실 복구 시간: " << recovery_us << "us"
-                                << " (수신 간격=" << gap_us << "us, 정상 주기=" << expected_us
+                                << " (수신 간격=" << gap_us << "us, 기준 주기=" << base_us
                                 << "us, seq " << last_seq_ << " -> " << seq << ")";
                 std::cout << "[loss] seq " << last_seq_ << " -> " << seq << ": 복구 시간 "
-                          << recovery_us << "us (수신 간격 " << gap_us << "us)" << std::endl;
+                          << recovery_us << "us (수신 간격 " << gap_us << "us, 기준 " << base_us
+                          << "us)" << std::endl;
 
                 std::lock_guard<std::mutex> its_lock(mutex_);
                 ++flagged_;
                 recovery_sum_us_ += recovery_us;
                 if (min_losses_ > 0 && flagged_ >= min_losses_)
                     condition_.notify_one();
+                // Do not fold this gap into the baseline - it is the very thing we just
+                // decided is NOT normal, and folding it in would drag the baseline upward.
+            } else {
+                recent_gaps_.push_back(gap_us);
+                if (recent_gaps_.size() > kBaselineWindow)
+                    recent_gaps_.pop_front();
             }
         } else {
             have_last_ = true;
@@ -242,6 +254,19 @@ private:
     bool have_last_;
     uint64_t last_seq_;
     std::chrono::time_point<std::chrono::high_resolution_clock> last_time_;
+
+    // Self-calibrating "normal gap" baseline - see the class comment.
+    static constexpr size_t kBaselineWindow = 20;
+    static constexpr size_t kMinBaselineSamples = 5;
+    std::deque<int64_t> recent_gaps_; // last kBaselineWindow unflagged gaps, most recent last
+
+    int64_t baseline_us() const {
+        if (recent_gaps_.size() < kMinBaselineSamples)
+            return static_cast<int64_t>(cycle_) * 1000; // not enough data yet - seed from --cycle
+        std::vector<int64_t> sorted(recent_gaps_.begin(), recent_gaps_.end());
+        std::sort(sorted.begin(), sorted.end());
+        return sorted[sorted.size() / 2]; // median: robust to the occasional missed flag
+    }
 
     uint64_t received_;
     uint64_t flagged_;
