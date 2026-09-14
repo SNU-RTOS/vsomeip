@@ -5,6 +5,12 @@
 # NOTE: none of this compensates for running SOME/IP over Wi-Fi. A wired GbE hop
 # on this LAN costs ~0.24 ms round trip; the same hop over 5 GHz Wi-Fi costs
 # ~2.0 ms with multi-millisecond jitter. Use Ethernet.
+#
+# NOTE: without an explicit interface argument, this auto-detects via the DEFAULT route -
+# which a gateway-less direct link (e.g. two boards' Ethernet ports cabled straight
+# together, no switch) never has, so it silently tunes some other interface (typically
+# Wi-Fi) instead. On such a link either pass the interface explicitly, or use ./tune-all.sh
+# <peer-ip> instead, which derives it from the actual route to the peer.
 set -e
 [ "$(id -u)" -eq 0 ] || { echo "run me with sudo"; exit 1; }
 

@@ -14,11 +14,11 @@ Quick reference for reproducing the current numbers from a clean checkout on bot
    sudo nmcli connection modify "Wired connection 1" autoconnect no   # old DHCP profile, if present
    ```
 3. Thor's JSON configs (`config/vsomeip-{udp,tcp}-{client,service}.json`) are tracked with `unicast: 10.10.10.1`. On the Orin, override `unicast` to `10.10.10.2` in all four — **as an uncommitted local change**, never commit the Orin's addresses over Thor's.
-4. Apply host tuning on both (volatile — re-run after every reboot):
+4. Apply host tuning on both, **once per reboot** — not before every individual test run. Both scripts set volatile host state (governor, cpuidle, EEE, a route's `rto_min`, a sysctl) that stays in effect until the next reboot regardless of how many SD/TCP runs happen in between, and there's no ordering requirement against `request_sd.sh`/`response_sd.sh`/`request_tcp.sh`/`response_tcp.sh` either:
    ```bash
-   sudo ./tune-latency.sh <iface>                       # cc7 idle off, governor=performance, EEE off
-   sudo ./tcp-recovery/tune_tcp_recovery.sh <peer-ip>    # TCP only: rto_min 1ms + tcp_reordering=1
+   sudo ./tune-all.sh <peer-ip>
    ```
+   `tune-all.sh` is `tune-latency.sh` (host: cc7 idle off, governor=performance, EEE off — helps SD and TCP alike) plus `tcp-recovery/tune_tcp_recovery.sh` (TCP-only: `rto_min` 1 ms + `tcp_reordering=1`) in one call, both driven off `<peer-ip>` so the interface is derived from the actual route to the peer — pass the peer IP even for SD-only use, since on this project's gateway-less direct link (no default route) that's the only reliable way to find the right interface at all; without it, `tune-latency.sh` alone silently tunes whatever interface *does* have a default route (typically Wi-Fi) instead. The two underlying scripts still work standalone if you only want one of them.
 
 **SD (server = either board, client = the other — see "Role Swap Compatibility" below):**
 

@@ -17,7 +17,9 @@
   `response_tcp.sh`가 내부적으로 이걸 쓴다.
 - [analyze_recovery.py](analyze_recovery.py) - 서버 쪽 tcpdump 캡처 하나로 복구 시간을 계산 (원리는
   아래 "왜 서버 캡처만으로 되나" 참고)
-- [tune_tcp_recovery.sh](tune_tcp_recovery.sh) - 복구 시간을 줄이는 커널 설정 적용 (양쪽 방법 공통)
+- [tune_tcp_recovery.sh](tune_tcp_recovery.sh) - 복구 시간을 줄이는 커널 설정 적용 (양쪽 방법 공통).
+  재부팅 후 한 번만 실행하면 됨 - 매 테스트 실행 전에 다시 돌릴 필요 없음. `../tune-latency.sh`와
+  같이 한 번에 적용하려면 `../tune-all.sh <피어 IP>` 참고.
 - [run_experiment.sh](run_experiment.sh) - `inject_loss.sh`+캡처+`analyze_recovery.py`를 SSH로 묶어
   한 번에 실행하는 편의 스크립트 (이 프로젝트의 Thor↔Orin 구성 전용)
 
@@ -218,7 +220,10 @@ Thor(서버, 유선) → Orin(클라이언트, Wi-Fi), `--cycle 5`, 최초 전�
 ## `tune_tcp_recovery.sh`가 하는 일과 실측 효과
 
 TCP **서버**(재전송을 보내는 쪽) 에서 실행. 두 설정 모두 휘발성(재부팅하면 사라짐)이고 되돌리는 명령을
-출력해 준다.
+출력해 준다. **재부팅마다 한 번만 실행하면 된다** - 그 뒤로 `response_tcp.sh`/`request_tcp.sh`를
+몇 번을 돌리든 다시 적용할 필요 없다. `../tune-latency.sh`와 순서를 신경 쓸 필요도 없다 - 서로 다른
+설정을 건드리므로(하나는 CPU/NIC, 하나는 TCP 커널 파라미터) 어느 쪽을 먼저 실행해도 상관없다.
+`sudo ../tune-all.sh <피어 IP>`로 둘을 한 번에 적용할 수 있다.
 
 | 설정 | 무엇을 하나 | 왜 |
 |---|---|---|
