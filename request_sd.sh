@@ -26,9 +26,11 @@ do
         wait $PID 2>/dev/null
     fi
 
-    TIME=$(grep '매칭까지 처리 시간' temp_output.txt | awk -F' ' '{print $NF}' | tr -d 'us')
+    # -m1: on_availability()가 간혹(재전송된 중복 OfferService 등으로) 두 번 이상 로그를
+    # 남기면 TIME이 여러 줄이 되어 아래 bc 계산이 깨진다 - 그 중 첫 줄(최초 도달 시각 기준)만 쓴다.
+    TIME=$(grep -m1 '매칭까지 처리 시간' temp_output.txt | awk -F' ' '{print $NF}' | tr -d 'us')
     echo "실행 횟수: $i, 처리 시간: $TIME us"
-    if [[ -n $TIME ]]; then
+    if [[ $TIME =~ ^[0-9]+$ ]]; then
         total_time=$(echo "$total_time + $TIME" | bc)
         ((count++))
     fi

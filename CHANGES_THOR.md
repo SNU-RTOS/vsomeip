@@ -1,5 +1,62 @@
 # vsomeip Thor Branch Changes
 
+## Reproducing These Results
+
+Quick reference for reproducing the current numbers from a clean checkout on both boards. For *why* each piece exists, see the dated sections below — this is just the "run these commands" summary, kept up to date as the defaults change.
+
+**One-time setup (both boards):**
+
+1. Build this branch's `libvsomeip3` and the `examples/` (`request-sd`, `response-sd`, `request-tcp-recovery`, `response-tcp-recovery`) — see the top-level `README.md` build command.
+2. Physically connect Thor's `enP2p1s0` to the Orin's `eno1` with an Ethernet cable (no switch in between). Configure a static IP on each via NetworkManager (not `ip addr add` — see "Direct Ethernet Link" below for why):
+   ```bash
+   sudo nmcli connection add type ethernet ifname <iface> con-name thor-orin-direct \
+       ipv4.method manual ipv4.addresses <10.10.10.1 on Thor, .2 on Orin>/24 ipv6.method ignore
+   sudo nmcli connection modify "Wired connection 1" autoconnect no   # old DHCP profile, if present
+   ```
+3. Thor's JSON configs (`config/vsomeip-{udp,tcp}-{client,service}.json`) are tracked with `unicast: 10.10.10.1`. On the Orin, override `unicast` to `10.10.10.2` in all four — **as an uncommitted local change**, never commit the Orin's addresses over Thor's.
+4. Apply host tuning on both (volatile — re-run after every reboot):
+   ```bash
+   sudo ./tune-latency.sh <iface>                       # cc7 idle off, governor=performance, EEE off
+   sudo ./tcp-recovery/tune_tcp_recovery.sh <peer-ip>    # TCP only: rto_min 1ms + tcp_reordering=1
+   ```
+
+**SD (server = either board, client = the other — see "Role Swap Compatibility" below):**
+
+```bash
+./response_sd.sh          # on the server
+bash request_sd.sh        # on the client — 100 runs, prints per-run time + its own (fragile, see
+                           # below) average; cross-check with your own min/p50/p90/max from the
+                           # "실행 횟수: N, 처리 시간: X us" lines if the printed average looks off
+```
+
+Expect median ~1.2 ms, occasional outliers up to a few ms, rarely (seen once in ~200 runs) a multi-hundred-ms one tied to a lost FindService needing a full retry cycle — not reproduced on retry, not chased further.
+
+**TCP packet recovery, application-level (primary method — client's own log, no SSH needed):**
+
+```bash
+sudo ./response_tcp.sh <client-ip>     # on the server — starts loss injection too
+./request_tcp.sh                       # on the client — watch for "패킷 유실 복구 시간: Xus"
+```
+
+Expect mean ~2.7 ms (defaults: `--cycle 1 --threshold 3.0`). Always sanity-check a `NO_DROP=1 sudo ./response_tcp.sh <client-ip>` baseline first if you change `--cycle` — the threshold has to be recalibrated against it (see `tcp-recovery/README.md`).
+
+**TCP packet recovery, wire-level (cross-check — needs SSH between the boards):**
+
+```bash
+sudo -E ./tcp-recovery/run_experiment.sh <label> stream 1 40 \
+    --server-ip <server-ip> --client-ip <client-ip> --client-host <user>@<client-ip> --client-sudo
+```
+
+Expect mean ~2.4 ms, median ~0.57 ms (with `tune_tcp_recovery.sh` applied). This is the ground-truth number the application-level one is checked against.
+
+**Common gotchas when re-running any of the above** (all encountered and fixed in this document's history, listed here since they'll happen again):
+- A prior run's server process still holds the TCP port → `bind failed (Address already in use)`. Check `sudo ss -ltnp | grep 30510` and kill it before restarting.
+- Leftover `/tmp/vsomeip-0` / `/tmp/vsomeip.lck` from a `kill -9`'d process → `rm -f` them (as the user that owned them, or `sudo`).
+- Leftover `inject_loss.sh` rules from an interrupted run → `sudo ./tcp-recovery/inject_loss.sh stop <server-ip> <client-ip>` is idempotent, safe to run even if nothing is active.
+- `set -e` scripts (`response_tcp.sh`, `run_experiment.sh`) that background a long-lived process and get killed with `kill -9` skip their own `trap cleanup EXIT` — the three points above are exactly what that cleanup would otherwise have handled.
+
+---
+
 ## Goal
 
 Reduce service discovery (SD) latency between the AGX Thor and the AGX Orin to **2 ms**, measured by `examples/request-sd.cpp` as the time from the client's `ST_REGISTERED` state callback to its `on_availability` callback for service `0x1234.0x5678` over UDP.
@@ -230,6 +287,14 @@ Checked on 2026-09-14 by running Thor as server and Orin as client with the unmo
 
 **Per-device `unicast`:** the tracked JSON files carry Thor's address. The Orin keeps `192.168.196.122` as an uncommitted local change — do not commit the JSON files from the Orin.
 
+## `request_sd.sh`'s printed average can be garbage — bug, fixed
+
+Found while re-checking the ~501 ms outlier below for reproducibility (a full second 100-run pass, not reproduced — max was 5.3 ms that time). The re-run's own printed `평균 처리 시간:` line came out as `5342` followed by a wall of stray numbers on their own lines — not a valid average at all, even though every individual `실행 횟수: N, 처리 시간: X us` line that run printed was fine (independently verified: n=100, min 779 µs, p50 1386 µs, max 5342 µs — no outlier).
+
+Cause: `request-sd`'s `on_availability` occasionally logs "매칭까지 처리 시간" more than once in a single run (seen with duplicate/retransmitted OfferService replies). `TIME=$(grep '매칭까지 처리 시간' temp_output.txt | ...)` had no `-m1`, so on those runs `$TIME` became multiple newline-separated numbers, and feeding that into `total_time=$(echo "$total_time + $TIME" | bc)` corrupted the running total for the rest of the script — hence the accumulated `평균 처리 시간:` at the end being nonsense, while each individual per-run print (computed independently, before accumulation) stayed correct.
+
+Fixed: `grep -m1` (first match only) plus a `[[ $TIME =~ ^[0-9]+$ ]]` guard before accumulating, so a malformed extraction is skipped (and `count` stays accurate) instead of corrupting `total_time`. Per-run lines were never wrong; only trust the script's own final average after this fix — before it, always cross-check with your own `grep -oE '처리 시간: [0-9]+' | ...` over the per-run lines, which is what every number in this document actually came from anyway.
+
 ---
 
 # Direct Ethernet Link (Thor↔Orin)
@@ -264,7 +329,7 @@ Fixed by adding the same `VSOMEIP_SD_FAST_START="${VSOMEIP_SD_FAST_START:-1}"` d
 | — outlier | 1 | 500,924 µs | — | — | — |
 | Wi-Fi (previous) | ~100 | ~3100 µs | — | — | — |
 
-99/100 runs landed under 1.5 ms — comfortably under the 2 ms target. The one ~501 ms outlier (run 55 of 100) looked like a single dropped/delayed FindService needing a full `repetitions_base_delay` retry cycle; not reproduced on a second, shorter run, not investigated further.
+99/100 runs landed under 1.5 ms — comfortably under the 2 ms target. The one ~501 ms outlier (run 55 of 100) looked like a single dropped/delayed FindService needing a full `repetitions_base_delay` retry cycle; **re-ran the full 100 a second time and it didn't recur** (that pass: n=100, min 779 µs, p50 1386 µs, max 5342 µs, no outlier at all) — treating it as a rare, non-systemic fluke rather than something to chase further. That second run also surfaced an unrelated bug in the test script itself, fixed separately above ("`request_sd.sh`'s printed average can be garbage").
 
 **TCP packet recovery, wire-level (`tcp-recovery/analyze_recovery.py`'s `[C]`, `--cycle 5`, 1-in-8 loss, 40 s):**
 
@@ -290,7 +355,9 @@ Barely moved despite the link and kernel tuning both improving the wire-level nu
 
 The fix runs the other way: since the real interval scales with the requested one, asking for a *shorter* cycle shortens the real interval too, which is what actually matters for this measurement (a tight real interval means the next event — the "trigger" a loss needs to be noticed — arrives soon after the loss). Re-ran with `--cycle 1 --threshold 3.0` (the 3× threshold matches the ~7 ms real interval at this cycle, checked against a `NO_DROP=1` baseline: 0/2828 false positives): mean dropped from 7.43/7.78 ms (old `--cycle 5` default, untuned/tuned) to **2.73 ms** (n=71) and **2.76 ms** (n=81, repeat run) — line up with the wire-level 2.39–2.70 ms almost exactly. `request_tcp.sh`/`response_tcp.sh` now default to `--cycle 1 --threshold 3.0`.
 
-The underlying ~15%-efficiency ceiling itself is still unexplained and untouched — vsomeip's TCP send path does *something* that caps throughput at roughly a sixth of whatever's requested, on this system, regardless of link or cycle. Worth reading `tcp_server_endpoint_impl`'s send path for anyone who wants to chase it further; out of scope here (host/network tuning, not vsomeip code changes).
+**Follow-up 2: the earlier `wait_until_sent`/blocking-caller theory above is wrong — disproved by direct instrumentation, not just re-guessed.** Added temporary timing around `app_->notify()` and around the full publish-loop iteration in `response-tcp-recovery.cpp` (`--cycle 1`, rebuilt, run and reverted — not committed). Result: **both stay at almost exactly the requested 1 ms, every iteration, for 2500+ consecutive calls, with or without a client connected.** `notify()` itself never took more than a few µs. So the publish loop is not stalled, blocked, or throttled by anything — it keeps calling `notify()` at full speed the whole time. The `wait_until_sent: Maximum wait time for send operation exceeded` line quoted above is real, but it is a rare *timeout* event (10 s ceiling, `VSOMEIP_MAX_TCP_SENT_WAIT_TIME`) that fired once near a run's end — not a continuous throttle explaining an ~85% loss throughout.
+
+That leaves the ~15% ceiling's actual location unidentified, past what a caller-side instrumentation can see — somewhere between the (confirmed-uncongested) call to `notify()` and the client's socket: vsomeip's per-connection send queue (`tcp_server_endpoint_impl`'s `queue_`, apparently unbounded by default — `check_queue_limit`'s cap was never hit, no "queue size limit reached" logged), the `boost::asio::async_write` completion chain, or the receive/dispatch side on the client. Whichever it is, it does not depend on link speed (same ~15% over Wi-Fi and over this 5 Gbps direct link) or on the kernel tuning applied elsewhere in this document. Not chased further — would mean reading vsomeip's internal queue/io_context code, not host or network configuration, and the practical workaround (shorter `--cycle`, above) already closes the gap to the wire-level number for this project's purposes.
 
 ## What this doesn't change
 
