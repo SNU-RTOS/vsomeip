@@ -35,10 +35,10 @@ Expect median ~1.2 ms, occasional outliers up to a few ms, rarely (seen once in 
 
 ```bash
 sudo ./response_tcp.sh <client-ip>     # on the server — starts loss injection too
-./request_tcp.sh                       # on the client — watch for "패킷 유실 복구 시간: Xus"
+./request_tcp.sh                       # on the client — stops itself after 10 flagged events
 ```
 
-Expect mean ~2.7 ms (defaults: `--cycle 1 --threshold 3.0`). Always sanity-check a `NO_DROP=1 sudo ./response_tcp.sh <client-ip>` baseline first if you change `--cycle` — the threshold has to be recalibrated against it (see `tcp-recovery/README.md`).
+Prints its own summary and exits: `총 수신 N건 중 M건 유실, 평균 복구 시간 Xus`, expect mean ~2.7 ms (defaults: `--cycle 1 --threshold 3.0`). The "normal gap" baseline is self-calibrating (median of recent unflagged gaps, `--cycle` only seeds it) — a `--cycle` that doesn't match the server is a slower warm-up now, not a correctness bug, but `--threshold` is still worth a `NO_DROP=1 sudo ./response_tcp.sh <client-ip>` sanity check if you change `--cycle` a lot (see `tcp-recovery/README.md`).
 
 **TCP packet recovery, wire-level (cross-check — needs SSH between the boards):**
 
@@ -47,7 +47,7 @@ sudo -E ./tcp-recovery/run_experiment.sh <label> stream 1 40 \
     --server-ip <server-ip> --client-ip <client-ip> --client-host <user>@<client-ip> --client-sudo
 ```
 
-Expect mean ~2.4 ms, median ~0.57 ms (with `tune_tcp_recovery.sh` applied). This is the ground-truth number the application-level one is checked against.
+Expect mean ~0.58 ms, 100% of individual events ≤2 ms (`--cycle 1` — this is what the application-level number above is checked against, and where most of the gap between the two comes from; see "Self-stop, self-calibrating baseline, and finding `--cycle 1`" below). **Use `--cycle 1`, not a larger one** — the `--cycle 5` this project used earlier gives a mean several times worse for reasons unrelated to loss (kernel-tick-quantized RACK waits), not a useful comparison point.
 
 **Common gotchas when re-running any of the above** (all encountered and fixed in this document's history, listed here since they'll happen again):
 - A prior run's server process still holds the TCP port → `bind failed (Address already in use)`. Check `sudo ss -ltnp | grep 30510` and kill it before restarting.
@@ -450,8 +450,34 @@ Breaking down the best-case 3.46 ms:
 
 Two things neither script touches:
 
-1. **`CONFIG_HZ=250` on both boards.** Most of the 3–10 ms RACK wait looks like tick rounding. A `CONFIG_HZ=1000` rebuild would plausibly bring this to ~1.8 ms, but a kernel rebuild on this physical hardware is hard to reverse and risks a failed boot — not attempted without explicit approval.
-2. **The Orin is on Wi-Fi.** Same root cause as the SD latency above; a wired Orin measured 0.24 ms RTT on this LAN vs. 1.5–1.9 ms over Wi-Fi.
+1. ~~**`CONFIG_HZ=250` on both boards.**~~ **Superseded, see below** — turns out this only bites at `--cycle 5`; `--cycle 1` sidesteps it entirely without touching the kernel.
+2. ~~**The Orin is on Wi-Fi.**~~ **Resolved** — see "Direct Ethernet Link" above.
+
+## Self-stop, self-calibrating baseline, and finding `--cycle 1` (2026-09-14)
+
+Three things, found investigating a report that loss went nearly undetected when the client was given custom `--cycle`/`--threshold` values.
+
+**1. Reproduced the report exactly.** Server at `--cycle 1` (its real gap, per the throughput sweep above, is ~7 ms), client told `--cycle 5` (so its flagging threshold was `5 × 1000µs × 2.0 = 10ms`) — that bar sits right at or above what a real recovery actually costs, so it silently swallowed real, ongoing loss: 0 flagged out of 2743 received over 20 s.
+
+**2. Self-calibrating baseline.** `request-tcp-recovery.cpp` no longer assumes the "normal gap" is `cycle × 1000µs` — `baseline_us()` tracks the median of the last 20 gaps that weren't themselves flagged as loss, with `--cycle` only seeding the first 5 samples. A mismatched `--cycle` is now a slower warm-up, not a correctness bug — the client converges to the link's actual behaviour on its own. Measuring this baseline directly also settled an open question: it converges to ~1.06 ms at `--cycle 1`, very close to nominal — so the traffic pattern is bursty (most gaps near the requested cycle, a minority of much larger ones pulling the *mean* throughput down to the ~15% figure in the sweep above), not uniformly slow. The client's own recovery-time number wasn't inflated by a bad baseline assumption after all; see point 3.
+
+**3. Re-ran the wire-level cross-check at `--cycle 1` for the first time — every prior wire-level number in this document was measured at `--cycle 5`.**
+
+| | n | mean | p50 | p90 | ≤2ms |
+|---|---|---|---|---|---|
+| `--cycle 1`, untuned | 92 | 0.59 ms | 0.57 ms | 0.59 ms | 100% |
+| `--cycle 1`, + `tune_tcp_recovery.sh` | 71 | 0.58 ms | 0.56 ms | 0.57 ms | 100% |
+| `--cycle 1`, `net.ipv4.tcp_recovery=0` (RACK off) | 112 | 1.19 ms | 0.57 ms | 1.70 ms | 90% |
+
+**The wire-level number already clears the 2 ms target comfortably at `--cycle 1`** — the `--cycle 5` tail (§ above, tied to `CONFIG_HZ=250`-quantized RACK reorder waits) essentially disappears at this cycle. Tried disabling RACK (`tcp_recovery=0`) on the theory that its reorder-window timer was the `--cycle 5` tail's cause — the opposite happened: RACK *on* (the default) was faster. That specific hypothesis about RACK's timer was wrong; `--cycle` turned out to be what mattered, not RACK.
+
+**What's left:** the application-level number (`request_tcp.sh`, via `--min-losses`, see below) still averages ~2.7 ms at `--cycle 1` — a real gap against the wire-level ~0.58 ms, not a baseline-calibration artifact (point 2 ruled that out). Likely vsomeip's own receive-side dispatch path (io thread → main-dispatch-thread handoff, particularly when a burst of backlogged messages lands at once after a retransmission), but not root-caused — would need instrumenting vsomeip's dispatch internals, not `request-tcp-recovery.cpp` itself. Next lead for anyone chasing the application-level number specifically below 2 ms; the wire-level ground truth is already there.
+
+**Also added `--min-losses` (default 10) to `request-tcp-recovery.cpp`:** the client now stops itself and prints `총 수신 N건 중 M건 유실, 평균 복구 시간 Xus` once that many events are flagged, instead of only on external kill. The actual shutdown runs on a dedicated watcher thread, not from `on_message()` or the signal handler directly — `application::stop()` joins vsomeip's own io threads, and calling it from a thread vsomeip itself dispatched onto risks deadlocking that join against itself. First version of this leaked the watcher thread (never joined before `its_sample` was destroyed, `std::thread`'s destructor calls `std::terminate()` if still joinable) — reproduced live (summary printed correctly, then "terminate called without an active exception" / abort), fixed with an explicit `join()` from `main()` after `app_->start()` returns.
+
+**Unrelated bug caught along the way:** `pgrep -x`/`pkill -x` match against the kernel's 15-character-truncated `comm` field. `response-tcp-recovery` (21 chars), `request-tcp-recovery` (21) and `subscribe-sample` (16) all exceed that, so stale-lock-file guards using `-x` against those names never actually detected a running instance — always "cleaned up" regardless, and let three `response-tcp-recovery` processes pile up fighting over port 30510 during this session's testing. Switched to `-f` (matches the full command line, no length limit) in `response_tcp.sh`, `request_tcp.sh`, and `run_experiment.sh`.
+
+**Separately, `response_tcp.sh` now rejects `<client-ip>` equal to its own configured address** — the mistake that produced this whole investigation's original symptom (`inject_loss.sh` silently resolving to `lo` because "the peer" was actually itself), with a clear error instead of silently misrouting.
 
 ## Rejected/not applicable
 
