@@ -7,9 +7,11 @@
 # "매칭까지 처리 시간"과 같은 방식으로, 이 클라이언트 자신이 직접 재는 값이다 (원리와 tcpdump
 # 기반 교차검증 방법은 tcp-recovery/README.md 참고).
 #
-# 사용법: ./request_tcp.sh [주기ms=1] [임계배수=3.0]
+# 사용법: ./request_tcp.sh [주기ms=1] [임계배수=3.0] [최소유실건수=10]
 #   주기(ms)는 response_tcp.sh에 준 값과 같아야 한다 - 다르면 임계값 판단이 어긋난다.
 #   임계배수: 실제 수신 간격이 [주기 x 임계배수]를 넘으면 "복구"로 본다. 기본 3.0.
+#   최소유실건수: 이만큼 유실을 감지하면 "총 수신 N건 중 M건 유실, 평균 복구 시간 Xus"를
+#   찍고 스스로 종료한다. 기본 10. 0을 주면 옛날처럼 죽을 때까지(Ctrl-C나 timeout) 계속 돈다.
 #
 #   주기를 1ms처럼 짧게 잡는 이유: vsomeip의 TCP 발행 자체가 요청한 주기와 무관하게 대략
 #   일정한 비율(이 환경에서 실측 ~15%)로만 나간다 - 주기를 길게 잡아도 이 비율은 그대로라
@@ -32,6 +34,7 @@ export VSOMEIP_SD_FAST_START="${VSOMEIP_SD_FAST_START:-1}"
 
 CYCLE="${1:-1}"
 THRESHOLD="${2:-3.0}"
+MIN_LOSSES="${3:-10}"
 
 # 이전 실행이 kill -9 등으로 비정상 종료되며 남긴 소켓/잠금파일이 있으면 정리 - 안 지우면
 # "Could not open /tmp/vsomeip.lck: Permission denied"로 초기화가 조용히 실패한다. 이전
@@ -39,4 +42,4 @@ THRESHOLD="${2:-3.0}"
 # sudo rm -f /tmp/vsomeip-0 /tmp/vsomeip.lck 을 직접 실행할 것.
 pgrep -x request-tcp-recovery >/dev/null 2>&1 || rm -f /tmp/vsomeip-0 /tmp/vsomeip.lck 2>/dev/null
 
-build/examples/request-tcp-recovery --cycle "$CYCLE" --threshold "$THRESHOLD"
+build/examples/request-tcp-recovery --cycle "$CYCLE" --threshold "$THRESHOLD" --min-losses "$MIN_LOSSES"

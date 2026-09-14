@@ -5,11 +5,15 @@
 #ifndef VSOMEIP_ENABLE_SIGNAL_HANDLING
 #include <csignal>
 #endif
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
+#include <thread>
 
 #include <vsomeip/vsomeip.hpp>
 #include <vsomeip/internal/logger.hpp>
@@ -30,26 +34,38 @@
 // `--threshold` times the configured `--cycle` as such a stall and logs the estimated
 // recovery time for it.
 //
+// `--cycle` and `--threshold` must describe the ACTUAL steady-state inter-arrival gap on
+// this link, not just the server's nominal --cycle: vsomeip's own TCP publish path only
+// delivers a roughly constant ~15% of whatever rate the server asks for (see
+// tcp-recovery/README.md "발행 주기가 왜 중요한가"), so the real gap is consistently
+// ~6.6-7x the server's --cycle argument, not equal to it. If this client's --cycle doesn't
+// match what the server was actually started with, the flagging threshold is checked
+// against the wrong baseline - too high a threshold (client thinks the cycle is longer
+// than it really is) silently swallows real losses instead of flagging them, and too low a
+// threshold (client thinks it's shorter) flags normal traffic as "loss". Always start from
+// a NO_DROP=1 baseline (see response_tcp.sh) at the exact --cycle you intend to use before
+// trusting flagged events.
+//
 // This is an application-level estimate, not a wire-level measurement: besides the network
 // recovery time proper, it includes vsomeip's own receive-side processing (tens to a few
-// hundred µs, see the SD latency writeup) AND, at a demanding cycle on a lossy/slow link,
-// vsomeip's own TCP send-side pacing on the SERVER (its `wait_until_sent` flow control,
-// implementation/endpoints/src/tcp_server_endpoint_impl.cpp) - measured on Wi-Fi at
-// --cycle 5, throughput was capped around 30 msg/s (vs. the nominal 200 msg/s) even with
-// no loss injected at all, so at that cycle most of a flagged gap is this pacing, not
-// packet loss. Always run a NO_DROP=1 baseline first (see response_tcp.sh) to see what
-// gaps look like on your link with nothing injected, and pick --threshold accordingly. For
-// a wire-level cross-check unaffected by any of this, see tcp-recovery/analyze_recovery.py.
+// hundred µs, see the SD latency writeup) AND vsomeip's own internal TCP publish-path
+// overhead mentioned above. For a wire-level cross-check unaffected by any of this, see
+// tcp-recovery/analyze_recovery.py.
 class client_sample {
 public:
-    client_sample(uint32_t _cycle, double _threshold)
+    client_sample(uint32_t _cycle, double _threshold, uint64_t _min_losses)
         : app_(vsomeip::runtime::get()->create_application()),
           cycle_(_cycle),
           threshold_(_threshold),
+          min_losses_(_min_losses),
           have_last_(false),
           last_seq_(0),
           received_(0),
-          flagged_(0) {
+          flagged_(0),
+          recovery_sum_us_(0),
+          stopped_(false),
+          running_(true),
+          watcher_thread_(std::bind(&client_sample::watch, this)) {
     }
 
     bool init() {
@@ -59,7 +75,10 @@ public:
         }
         std::cout << "TCP packet-recovery client: cycle=" << cycle_ << "ms, threshold="
                   << threshold_ << "x (recovery flagged when a gap exceeds "
-                  << static_cast<uint32_t>(cycle_ * threshold_) << "ms)" << std::endl;
+                  << static_cast<uint32_t>(cycle_ * threshold_) << "ms)";
+        if (min_losses_ > 0)
+            std::cout << ", stopping after " << min_losses_ << " flagged event(s)";
+        std::cout << std::endl;
 
         app_->register_state_handler(
                 std::bind(&client_sample::on_state, this, std::placeholders::_1));
@@ -84,13 +103,14 @@ public:
     }
 
 #ifndef VSOMEIP_ENABLE_SIGNAL_HANDLING
+    // External stop request (Ctrl-C, or `timeout` giving up because --min-losses was never
+    // reached). Safe to call from a signal handler: just wakes the watcher thread, which
+    // does the actual vsomeip shutdown from its own thread context (see the class comment
+    // on do_stop() for why that indirection matters).
     void stop() {
-        app_->clear_all_handler();
-        app_->unsubscribe(SAMPLE_SERVICE_ID, SAMPLE_INSTANCE_ID, SAMPLE_EVENTGROUP_ID);
-        app_->release_event(SAMPLE_SERVICE_ID, SAMPLE_INSTANCE_ID, SAMPLE_EVENT_ID);
-        app_->release_service(SAMPLE_SERVICE_ID, SAMPLE_INSTANCE_ID);
-        app_->stop();
-        print_summary();
+        std::lock_guard<std::mutex> its_lock(mutex_);
+        running_ = false;
+        condition_.notify_one();
     }
 #endif
 
@@ -134,7 +154,6 @@ public:
             }
 
             if (gap_us > static_cast<int64_t>(static_cast<double>(expected_us) * threshold_)) {
-                ++flagged_;
                 int64_t recovery_us = gap_us - expected_us;
                 if (recovery_us < 0)
                     recovery_us = 0;
@@ -143,6 +162,12 @@ public:
                                 << "us, seq " << last_seq_ << " -> " << seq << ")";
                 std::cout << "[loss] seq " << last_seq_ << " -> " << seq << ": 복구 시간 "
                           << recovery_us << "us (수신 간격 " << gap_us << "us)" << std::endl;
+
+                std::lock_guard<std::mutex> its_lock(mutex_);
+                ++flagged_;
+                recovery_sum_us_ += recovery_us;
+                if (min_losses_ > 0 && flagged_ >= min_losses_)
+                    condition_.notify_one();
             }
         } else {
             have_last_ = true;
@@ -153,14 +178,45 @@ public:
         last_time_ = now;
     }
 
+    // Runs on its own thread, never on a vsomeip-invoked one: application::stop() joins
+    // vsomeip's internal io threads, and calling it from a thread vsomeip itself dispatched
+    // on (e.g. straight out of on_message(), or out of a signal handler that might run on
+    // any thread) risks that join deadlocking against itself. This thread just waits for
+    // either "enough losses happened" or "someone asked us to stop", then performs the
+    // actual shutdown safely from here.
+    void watch() {
+        std::unique_lock<std::mutex> its_lock(mutex_);
+        condition_.wait(its_lock, [this] {
+            return !running_ || (min_losses_ > 0 && flagged_ >= min_losses_);
+        });
+        do_stop();
+    }
+
+    void do_stop() {
+        if (stopped_.exchange(true))
+            return; // already stopping (e.g. both Ctrl-C and --min-losses raced)
+        app_->clear_all_handler();
+        app_->unsubscribe(SAMPLE_SERVICE_ID, SAMPLE_INSTANCE_ID, SAMPLE_EVENTGROUP_ID);
+        app_->release_event(SAMPLE_SERVICE_ID, SAMPLE_INSTANCE_ID, SAMPLE_EVENT_ID);
+        app_->release_service(SAMPLE_SERVICE_ID, SAMPLE_INSTANCE_ID);
+        app_->stop();
+        print_summary();
+    }
+
     void print_summary() {
-        std::cout << "총 수신 " << received_ << "건, 유실/지연 감지 " << flagged_ << "건" << std::endl;
+        std::cout << "총 수신 " << received_ << "건 중 " << flagged_ << "건 유실";
+        if (flagged_ > 0) {
+            std::cout << ", 평균 복구 시간 " << (recovery_sum_us_ / static_cast<int64_t>(flagged_))
+                      << "us";
+        }
+        std::cout << std::endl;
     }
 
 private:
     std::shared_ptr<vsomeip::application> app_;
     uint32_t cycle_;
     double threshold_;
+    uint64_t min_losses_; // 0 = run until externally stopped (old behaviour)
 
     bool have_last_;
     uint64_t last_seq_;
@@ -168,6 +224,14 @@ private:
 
     uint64_t received_;
     uint64_t flagged_;
+    int64_t recovery_sum_us_;
+
+    std::atomic<bool> stopped_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool running_;
+    // running_ / mutex_ / condition_ must be initialized before this thread starts.
+    std::thread watcher_thread_;
 };
 
 #ifndef VSOMEIP_ENABLE_SIGNAL_HANDLING
@@ -179,11 +243,14 @@ void handle_signal(int _signal) {
 #endif
 
 int main(int argc, char **argv) {
-    uint32_t cycle = 5;       // must match the server's --cycle for the threshold to mean anything
-    double threshold = 2.0;   // gap > threshold * cycle is flagged as a loss+recovery stall
+    uint32_t cycle = 1;         // must match the server's --cycle for the threshold to mean anything
+    double threshold = 3.0;     // gap > threshold * cycle is flagged as a loss+recovery stall
+    uint64_t min_losses = 10;   // stop and print the summary once this many events are flagged;
+                                // 0 disables this and runs until externally stopped instead
 
     std::string cycle_arg("--cycle");
     std::string threshold_arg("--threshold");
+    std::string min_losses_arg("--min-losses");
     for (int i = 1; i < argc; i++) {
         if (cycle_arg == argv[i] && i + 1 < argc) {
             i++;
@@ -195,10 +262,15 @@ int main(int argc, char **argv) {
             std::stringstream converter;
             converter << argv[i];
             converter >> threshold;
+        } else if (min_losses_arg == argv[i] && i + 1 < argc) {
+            i++;
+            std::stringstream converter;
+            converter << argv[i];
+            converter >> min_losses;
         }
     }
 
-    client_sample its_sample(cycle, threshold);
+    client_sample its_sample(cycle, threshold, min_losses);
 #ifndef VSOMEIP_ENABLE_SIGNAL_HANDLING
     its_sample_ptr = &its_sample;
     signal(SIGINT, handle_signal);
