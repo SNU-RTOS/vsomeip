@@ -33,4 +33,10 @@ export VSOMEIP_SD_FAST_START="${VSOMEIP_SD_FAST_START:-1}"
 CYCLE="${1:-1}"
 THRESHOLD="${2:-3.0}"
 
+# 이전 실행이 kill -9 등으로 비정상 종료되며 남긴 소켓/잠금파일이 있으면 정리 - 안 지우면
+# "Could not open /tmp/vsomeip.lck: Permission denied"로 초기화가 조용히 실패한다. 이전
+# 실행을 sudo로 돌렸다면 그 파일은 root 소유라 이 줄(비-root)로는 못 지운다 - 그럴 땐
+# sudo rm -f /tmp/vsomeip-0 /tmp/vsomeip.lck 을 직접 실행할 것.
+pgrep -x request-tcp-recovery >/dev/null 2>&1 || rm -f /tmp/vsomeip-0 /tmp/vsomeip.lck 2>/dev/null
+
 build/examples/request-tcp-recovery --cycle "$CYCLE" --threshold "$THRESHOLD"

@@ -10,6 +10,10 @@ export VSOMEIP_SD_FAST_START="${VSOMEIP_SD_FAST_START:-1}"
 
 BINARY_PATH="build/examples/request-sd"
 
+# 이전 실행이 kill -9 등으로 비정상 종료되며 남긴 소켓/잠금파일이 있으면 정리 - 안 지우면
+# "Could not open /tmp/vsomeip.lck: Permission denied"로 첫 반복부터 초기화가 실패한다.
+pgrep -x request-sd >/dev/null 2>&1 || rm -f /tmp/vsomeip-0 /tmp/vsomeip.lck 2>/dev/null
+
 total_time=0
 count=0
 

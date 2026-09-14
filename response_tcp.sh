@@ -21,6 +21,16 @@ EVERY="${3:-8}"
 NO_DROP="${NO_DROP:-0}"
 
 SERVER_IP=$(python3 -c "import json; print(json.load(open('config/vsomeip-tcp-service.json'))['unicast'])")
+[ "$CLIENT_IP" != "$SERVER_IP" ] || {
+    echo "<클라이언트 IP>에 이 보드 자신의 주소($SERVER_IP)를 줬다 - 상대(Orin 등) 보드의 IP를 줘야 한다" >&2
+    exit 1
+}
+
+# 이전 실행이 kill -9 등으로 비정상 종료되며 남긴 소켓/잠금파일이 있으면 새로 시작하기 전에 정리한다.
+# 안 지우면 "Could not open /tmp/vsomeip.lck: Permission denied" 로 초기화 자체가 조용히 실패하고
+# (vsomeip 라이브러리가 그 뒤 비정상 종료까지 이어짐) 원인을 알기 어렵다. 같은 바이너리가 실제로
+# 아직 돌고 있으면 건드리지 않는다.
+pgrep -x response-tcp-recovery >/dev/null 2>&1 || rm -f /tmp/vsomeip-0 /tmp/vsomeip.lck 2>/dev/null
 
 cleanup() {
     [ "$NO_DROP" = 1 ] || \
