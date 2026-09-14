@@ -30,7 +30,9 @@ SERVER_IP=$(python3 -c "import json; print(json.load(open('config/vsomeip-tcp-se
 # 안 지우면 "Could not open /tmp/vsomeip.lck: Permission denied" 로 초기화 자체가 조용히 실패하고
 # (vsomeip 라이브러리가 그 뒤 비정상 종료까지 이어짐) 원인을 알기 어렵다. 같은 바이너리가 실제로
 # 아직 돌고 있으면 건드리지 않는다.
-pgrep -x response-tcp-recovery >/dev/null 2>&1 || rm -f /tmp/vsomeip-0 /tmp/vsomeip.lck 2>/dev/null
+# -f를 쓰는 이유: "response-tcp-recovery"가 15자를 넘어 pgrep -x(정확 일치, 15자에서 잘림)로는
+# 절대 못 찾는다 - 그러면 "안 돌고 있다"고 항상 잘못 판단해서 이 가드 자체가 무의미해진다.
+pgrep -f build/examples/response-tcp-recovery >/dev/null 2>&1 || rm -f /tmp/vsomeip-0 /tmp/vsomeip.lck 2>/dev/null
 
 cleanup() {
     [ "$NO_DROP" = 1 ] || \

@@ -40,6 +40,8 @@ MIN_LOSSES="${3:-10}"
 # "Could not open /tmp/vsomeip.lck: Permission denied"로 초기화가 조용히 실패한다. 이전
 # 실행을 sudo로 돌렸다면 그 파일은 root 소유라 이 줄(비-root)로는 못 지운다 - 그럴 땐
 # sudo rm -f /tmp/vsomeip-0 /tmp/vsomeip.lck 을 직접 실행할 것.
-pgrep -x request-tcp-recovery >/dev/null 2>&1 || rm -f /tmp/vsomeip-0 /tmp/vsomeip.lck 2>/dev/null
+# -f를 쓰는 이유: "request-tcp-recovery"가 15자를 넘어 pgrep -x(정확 일치, 15자에서 잘림)로는
+# 절대 못 찾는다 - 그러면 "안 돌고 있다"고 항상 잘못 판단해서 이 가드 자체가 무의미해진다.
+pgrep -f build/examples/request-tcp-recovery >/dev/null 2>&1 || rm -f /tmp/vsomeip-0 /tmp/vsomeip.lck 2>/dev/null
 
 build/examples/request-tcp-recovery --cycle "$CYCLE" --threshold "$THRESHOLD" --min-losses "$MIN_LOSSES"

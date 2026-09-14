@@ -139,7 +139,9 @@ cleanup() {
     # failure is NOT exempted the way a plain `&&` chain member would be, so it would
     # abort this trap handler right here without `|| true`.
     [ -n "$SVC" ] && { kill "$SVC" 2>/dev/null; sleep 1; kill -9 "$SVC" 2>/dev/null || true; }
-    run_remote "$CLIENT_PREFIX bash -c 'cd $VSOMEIP_DIR && pkill -x subscribe-sample; pkill -x request-sample; rm -f /tmp/vsomeip-* /tmp/vsomeip.lck'" 2>/dev/null || true
+    # pkill -f, not -x, for subscribe-sample: at 16 characters it exceeds the 15-char comm-name
+    # limit pgrep/pkill -x matches against, so -x would silently match nothing at all.
+    run_remote "$CLIENT_PREFIX bash -c 'cd $VSOMEIP_DIR && pkill -f build/examples/subscribe-sample; pkill -x request-sample; rm -f /tmp/vsomeip-* /tmp/vsomeip.lck'" 2>/dev/null || true
 }
 trap cleanup EXIT
 
