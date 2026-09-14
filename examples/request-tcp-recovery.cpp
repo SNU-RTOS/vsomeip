@@ -63,6 +63,7 @@ public:
           received_(0),
           flagged_(0),
           recovery_sum_us_(0),
+          initialized_(false),
           stopped_(false),
           running_(true),
           watcher_thread_(std::bind(&client_sample::watch, this)) {
@@ -73,6 +74,7 @@ public:
             std::cerr << "Couldn't initialize application" << std::endl;
             return false;
         }
+        initialized_ = true;
         std::cout << "TCP packet-recovery client: cycle=" << cycle_ << "ms, threshold="
                   << threshold_ << "x (recovery flagged when a gap exceeds "
                   << static_cast<uint32_t>(cycle_ * threshold_) << "ms)";
@@ -195,12 +197,31 @@ public:
     void do_stop() {
         if (stopped_.exchange(true))
             return; // already stopping (e.g. both Ctrl-C and --min-losses raced)
-        app_->clear_all_handler();
-        app_->unsubscribe(SAMPLE_SERVICE_ID, SAMPLE_INSTANCE_ID, SAMPLE_EVENTGROUP_ID);
-        app_->release_event(SAMPLE_SERVICE_ID, SAMPLE_INSTANCE_ID, SAMPLE_EVENT_ID);
-        app_->release_service(SAMPLE_SERVICE_ID, SAMPLE_INSTANCE_ID);
-        app_->stop();
+        if (initialized_) {
+            // Skipped when app_->init() itself failed (main()'s init()-failure path calls
+            // stop()+join() to unblock the watcher thread cleanly): none of these were ever
+            // set up in that case, and there is nothing running to stop.
+            app_->clear_all_handler();
+            app_->unsubscribe(SAMPLE_SERVICE_ID, SAMPLE_INSTANCE_ID, SAMPLE_EVENTGROUP_ID);
+            app_->release_event(SAMPLE_SERVICE_ID, SAMPLE_INSTANCE_ID, SAMPLE_EVENT_ID);
+            app_->release_service(SAMPLE_SERVICE_ID, SAMPLE_INSTANCE_ID);
+        }
+        // Print before stop(): stop() is what unblocks app_->start() on main()'s thread,
+        // which then joins this thread (see join()) before letting `its_sample` in main()
+        // go out of scope - so anything this thread still needs from `*this` (the counters
+        // print_summary() reads) must happen before that, not after.
         print_summary();
+        if (initialized_)
+            app_->stop();
+    }
+
+    // Called from main(), after app_->start() returns there - never from this object's own
+    // watcher thread (that would be a self-join deadlock). Blocks until do_stop() has fully
+    // finished on the watcher thread, so it is safe for main() to destroy `its_sample`
+    // immediately afterwards.
+    void join() {
+        if (watcher_thread_.joinable())
+            watcher_thread_.join();
     }
 
     void print_summary() {
@@ -226,6 +247,7 @@ private:
     uint64_t flagged_;
     int64_t recovery_sum_us_;
 
+    bool initialized_; // true once app_->init() has succeeded - guards do_stop()'s app_ calls
     std::atomic<bool> stopped_;
     std::mutex mutex_;
     std::condition_variable condition_;
@@ -279,8 +301,16 @@ int main(int argc, char **argv) {
     if (its_sample.init()) {
         std::cout << "sample start\n";
         its_sample.start();
+        its_sample.join();
         return 0;
     } else {
+        // watcher_thread_ is already running (started in the constructor, before init() was
+        // even tried) and blocked waiting for a stop request that will now never come from
+        // do_stop()'s normal path - ask it to stop and wait for it, or its_sample's
+        // destructor hits the same joinable-thread std::terminate() this whole join()
+        // dance exists to avoid.
+        its_sample.stop();
+        its_sample.join();
         return 1;
     }
 }
