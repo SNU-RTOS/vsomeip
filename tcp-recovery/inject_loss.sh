@@ -82,8 +82,25 @@ CHAIN=SOMEIP_LOSS
 # every Nth packet *matching everything before it in the rule*, not on the session id
 # itself. Restricting by IP length first keeps this aligned to one segment per
 # SOME/IP message in the common case where each message is one TCP segment.
+#
+# xt_u32 isn't guaranteed to be present - observed missing entirely (not just unloaded;
+# no xt_u32.ko anywhere under /lib/modules for that kernel) on a 5.15.185-tegra Orin as of
+# 2026-09, despite being available on the 5.10.104-tegra kernel this project started on
+# (kernels drift under system updates independently of this repo). `-C` on a rule that
+# can never actually match (source port 0) probes the match's availability with no side
+# effect either way - it fails with "Couldn't load match" if the extension itself is
+# missing, or the ordinary "does not exist" if it's just that this exact rule isn't
+# present, which tells us the module loaded fine. Fall back to source ip/port + Nth-packet
+# only (no length/session-id refinement) when it's unavailable, rather than hard-failing.
 U32="0&0xFFFF=${IPLEN}&&0>>22&0x3C@12>>26&0x3C@8&0x7=0"
-MATCH=(-p tcp -s "$SRV_IP" --sport "$PORT" -m u32 --u32 "$U32" -m statistic --mode nth --every "$EVERY" --packet 0)
+if iptables -t mangle -C OUTPUT -p tcp --sport 0 -m u32 --u32 "$U32" -j ACCEPT 2>&1 \
+        | grep -q "Couldn't load match"; then
+    echo "경고: 이 커널($(uname -r))엔 xt_u32가 없음 - IP 길이/SOME-IP 세션id 기반 선별 없이" \
+         "출발지 IP:포트 + Nth패킷만으로 유실을 주입함 (드물게 제어 패킷이 걸릴 수 있음)" >&2
+    MATCH=(-p tcp -s "$SRV_IP" --sport "$PORT" -m statistic --mode nth --every "$EVERY" --packet 0)
+else
+    MATCH=(-p tcp -s "$SRV_IP" --sport "$PORT" -m u32 --u32 "$U32" -m statistic --mode nth --every "$EVERY" --packet 0)
+fi
 
 case "$CMD" in
   start)
