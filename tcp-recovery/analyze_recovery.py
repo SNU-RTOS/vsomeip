@@ -38,21 +38,27 @@ PKT_RE = re.compile(
 SACK_RE = re.compile(r'sack \d+ \{(\d+):(\d+)')
 
 
-def parse_capture(path, port):
-    """Yield (t, is_server_side, flags, seq_start, seq_end, ack, sack_left) per packet."""
+def iter_pkt_lines(f, port):
+    """Yield (t, is_server_side, flags, seq_start, seq_end, ack, sack_left) per packet
+    line from any line-iterable of tcpdump -n -S -tt text output - an already-open file
+    (offline capture) or a live pipe from `tcpdump -l ...` (see live_recovery below)."""
     port = str(port)
+    for line in f:
+        m = PKT_RE.match(line)
+        if not m:
+            continue
+        t, pkt_port, flags = m.group(1), m.group(2), m.group(3)
+        s = int(m.group(4) or 0)
+        e = int(m.group(5) or 0)
+        ack = int(m.group(6) or 0)
+        sk = SACK_RE.search(line)
+        yield (float(t), pkt_port == port, flags, s, e, ack,
+               int(sk.group(1)) if sk else None)
+
+
+def parse_capture(path, port):
     with open(path) as f:
-        for line in f:
-            m = PKT_RE.match(line)
-            if not m:
-                continue
-            t, pkt_port, flags = m.group(1), m.group(2), m.group(3)
-            s = int(m.group(4) or 0)
-            e = int(m.group(5) or 0)
-            ack = int(m.group(6) or 0)
-            sk = SACK_RE.search(line)
-            yield (float(t), pkt_port == port, flags, s, e, ack,
-                   int(sk.group(1)) if sk else None)
+        yield from iter_pkt_lines(f, port)
 
 
 def find_retransmissions(rows):
@@ -120,14 +126,101 @@ def fmt(label, s):
             f"p90={s['p90']:.0f}us max={s['max']:.0f}us  (<=2ms: {s['le_2ms_pct']:.0f}%)")
 
 
+def live_recovery(port, min_losses):
+    """Same [B]/[C] logic as find_retransmissions(), but driven off a live line-buffered
+    tcpdump pipe (stdin) instead of a completed capture file, printing each [C] value the
+    instant it is computable and self-stopping after `min_losses` of them - mirroring
+    request-tcp-recovery.cpp's own --min-losses behaviour so the server- and client-side
+    logs read the same way and can be compared run-for-run. Ctrl-C also prints the summary
+    before exiting (same as request-tcp-recovery.cpp's signal handler).
+
+    find_retransmissions() cannot be reused as-is for this: it only appends to its result
+    lists after fully consuming its input, whereas here each event must be printed the
+    moment its own line arrives. The per-packet state machine is intentionally kept
+    identical to find_retransmissions()'s.
+    """
+    maxend, sent_at, first_sack = 0, {}, {}
+    total_sent = 0
+    reaction, recovery = [], []
+    timer_driven = 0
+
+    def print_summary():
+        n_loss = len(recovery) + timer_driven
+        line = f"[wire] 총 발행 {total_sent}건 중 {n_loss}건 유실"
+        if recovery:
+            line += f", 평균 복구 시간(wire) {sum(recovery) / len(recovery):.0f}us"
+        print(line, flush=True)
+        if reaction:
+            print(f"[wire]   [B] SACK 수신 -> 재전송 송신 (서버 반응 시간) {fmt('', summarize(reaction))}",
+                  flush=True)
+        if recovery:
+            print(f"[wire]   [C] ★ 클라이언트 기준 복구 시간              {fmt('', summarize(recovery))}",
+                  flush=True)
+        if timer_driven:
+            print(f"[wire]   (타이머 계기 재전송 {timer_driven}건은 직전 SACK이 캡처에 없어 시간 계산 불가)",
+                  flush=True)
+
+    print(f"[wire] 실시간 와이어 레벨 복구 시간 측정 시작 (port {port}"
+          + (f", {min_losses}건 감지 시 자동 종료" if min_losses > 0 else ", Ctrl-C로 종료")
+          + ")", flush=True)
+    try:
+        for t, is_srv, flags, s, e, ack, sack_left in iter_pkt_lines(sys.stdin, port):
+            if 'S' in flags:  # new connection: sequence space is unrelated to any previous one
+                maxend, sent_at, first_sack = 0, {}, {}
+                continue
+            if is_srv and e > s:
+                if e <= maxend:  # a send that doesn't extend the stream = retransmission
+                    hit = first_sack.pop(s, None)
+                    if hit is not None:
+                        t_sack, hole_left = hit
+                        reaction.append((t - t_sack) * 1e6)
+                        if hole_left in sent_at:
+                            rec_us = (t - sent_at[hole_left]) * 1e6
+                            recovery.append(rec_us)
+                            print(f"[wire] 유실 복구 확인: {rec_us:.0f}us  (누적 {len(recovery)}건)",
+                                  flush=True)
+                    else:
+                        timer_driven += 1
+                        print(f"[wire] 타이머 계기 재전송 감지 (SACK 없음, 누적 {timer_driven}건)",
+                              flush=True)
+                else:
+                    maxend = e
+                    sent_at[s] = t
+                    total_sent += 1
+            elif not is_srv and sack_left is not None and ack not in first_sack:
+                first_sack[ack] = (t, sack_left)
+
+            if min_losses > 0 and (len(recovery) + timer_driven) >= min_losses:
+                print_summary()
+                return 0
+    except KeyboardInterrupt:
+        print(flush=True)
+    print_summary()
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--capture", required=True,
-                     help="tcpdump -r <pcap> -n -S -tt --time-stamp-precision=micro output")
+    ap.add_argument("--capture",
+                     help="tcpdump -r <pcap> -n -S -tt --time-stamp-precision=micro output "
+                          "(ignored with --live)")
     ap.add_argument("--port", type=int, default=30510, help="reliable SOME/IP TCP port")
     ap.add_argument("--json", action="store_true", help="also print a JSON summary")
+    ap.add_argument("--live", action="store_true",
+                     help="read a live line-buffered tcpdump pipe from stdin instead of a "
+                          "finished --capture file, printing each recovery as it happens "
+                          "(see response_tcp.sh)")
+    ap.add_argument("--min-losses", type=int, default=10,
+                     help="--live only: self-stop and print the summary after this many "
+                          "detected losses (0 = run until stdin closes or Ctrl-C); default 10, "
+                          "matching request-tcp-recovery.cpp's --min-losses")
     args = ap.parse_args()
+
+    if args.live:
+        sys.exit(live_recovery(args.port, args.min_losses))
+    if not args.capture:
+        ap.error("--capture is required unless --live is given")
 
     try:
         rows = list(parse_capture(args.capture, args.port))
