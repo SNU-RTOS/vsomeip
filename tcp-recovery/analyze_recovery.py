@@ -126,6 +126,9 @@ def fmt(label, s):
             f"p90={s['p90']:.0f}us max={s['max']:.0f}us  (<=2ms: {s['le_2ms_pct']:.0f}%)")
 
 
+IDLE_TIMEOUT_S = 5
+
+
 def live_recovery(port, min_losses):
     """Same [B]/[C] logic as find_retransmissions(), but driven off a live line-buffered
     tcpdump pipe (stdin) instead of a completed capture file, printing each [C] value the
@@ -138,6 +141,16 @@ def live_recovery(port, min_losses):
     lists after fully consuming its input, whereas here each event must be printed the
     moment its own line arrives. The per-packet state machine is intentionally kept
     identical to find_retransmissions()'s.
+
+    Also self-stops after IDLE_TIMEOUT_S seconds without a single matching packet, once
+    traffic has been seen at least once. This is not just a nicety: the client side has its
+    own, independently-evaluated --min-losses, based on a different signal (its own
+    gap-vs-threshold heuristic vs. this function's SACK-matched retransmissions) - the two
+    are not guaranteed to reach their targets on the same event. If the client reaches its
+    count first, it unsubscribes and the TCP stream on this port goes silent; without this
+    timeout this function would then block forever waiting for one more retransmission that
+    will never come, and the caller (response_tcp.sh) would never get back to its trap to
+    stop loss injection and kill the server binary.
     """
     maxend, sent_at, first_sack = 0, {}, {}
     total_sent = 0
@@ -161,10 +174,26 @@ def live_recovery(port, min_losses):
                   flush=True)
 
     print(f"[wire] 실시간 와이어 레벨 복구 시간 측정 시작 (port {port}"
-          + (f", {min_losses}건 감지 시 자동 종료" if min_losses > 0 else ", Ctrl-C로 종료")
+          + (f", {min_losses}건 감지 시 자동 종료" if min_losses > 0 else "")
+          + f", 상대가 끊겨 {IDLE_TIMEOUT_S}초간 새 패킷이 없으면 자동 종료"
           + ")", flush=True)
+
+    import signal
+
+    class _Idle(Exception):
+        pass
+
+    def _on_alarm(signum, frame):
+        raise _Idle()
+
+    had_signal_alarm = hasattr(signal, "SIGALRM")
+    if had_signal_alarm:
+        signal.signal(signal.SIGALRM, _on_alarm)
+
     try:
         for t, is_srv, flags, s, e, ack, sack_left in iter_pkt_lines(sys.stdin, port):
+            if had_signal_alarm:
+                signal.alarm(IDLE_TIMEOUT_S)  # reset on every packet - only fires on silence
             if 'S' in flags:  # new connection: sequence space is unrelated to any previous one
                 maxend, sent_at, first_sack = 0, {}, {}
                 continue
@@ -191,9 +220,17 @@ def live_recovery(port, min_losses):
                 first_sack[ack] = (t, sack_left)
 
             if min_losses > 0 and (len(recovery) + timer_driven) >= min_losses:
+                if had_signal_alarm:
+                    signal.alarm(0)
                 print_summary()
                 return 0
+        if had_signal_alarm:
+            signal.alarm(0)
+    except _Idle:
+        print(f"[wire] {IDLE_TIMEOUT_S}초간 새 패킷 없음 - 상대가 이미 끝난 것으로 보고 종료", flush=True)
     except KeyboardInterrupt:
+        if had_signal_alarm:
+            signal.alarm(0)
         print(flush=True)
     print_summary()
     return 0

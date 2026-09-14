@@ -87,11 +87,21 @@ SVC=$!
 IFACE=$(ip route get "$CLIENT_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
 IFACE=${IFACE:-$(ip route show default | awk '/default/{print $5; exit}')}
 
-# -l: tcpdump 자신의 stdout을 파이프로 연결해도 줄 단위로 즉시 흘려보낸다 (기본은 파이프일 때
-# 풀버퍼링이라, 이게 없으면 분석 스크립트가 몇 초~몇 분씩 늦게 받는다). analyze_recovery.py가 기대하는
-# 포맷과 맞추기 위해 -n -S -tt --time-stamp-precision=micro는 offline 분석(run_experiment.sh)과 동일.
-# analyze_recovery.py --live가 --min-losses건에 도달해 먼저 끝나면, 파이프 반대쪽(tcpdump)은 다음
-# 쓰기 시도에서 SIGPIPE를 받아 스스로 죽는다 - 별도로 죽일 필요가 없다 (혹시 남더라도 위 cleanup에서
-# pgrep -f로 정리한다).
-tcpdump -i "$IFACE" -l -n -S -tt --time-stamp-precision=micro "tcp port $PORT" 2>/dev/null | \
-    python3 tcp-recovery/analyze_recovery.py --live --port "$PORT" --min-losses "$MIN_LOSSES"
+# tcpdump는 익명 파이프가 아니라 FIFO로 analyze_recovery.py에 이어준다 - 익명 파이프(`tcpdump | python3`)로
+# 직접 연결하면 analyze_recovery.py가 --min-losses에 먼저 도달해 조용히 끝났을 때, tcpdump는 "다음 패킷이
+# 와서 쓰기를 시도할 때"라야 SIGPIPE로 죽는다는 게 문제다 - 클라이언트가 이미 --min-losses에 먼저 도달해
+# 스스로 멈추고 연결을 끊은 경우(흔한 케이스: 두 min-losses가 정확히 같은 사건 수에 도달한다는 보장이
+# 없다) 그 뒤로는 해당 포트에 트래픽 자체가 없어 tcpdump가 영원히 쓰기를 시도하지 않고, 그러면
+# SIGPIPE도 영원히 오지 않아 tcpdump가 좀비처럼 남고 - 이 스크립트도 파이프라인이 안 끝나 트랩까지
+# 못 가 서버 프로세스와 유실 주입 규칙까지 같이 남는다. FIFO는 analyze_recovery.py가 끝나는 즉시(입력이
+# 남았든 안 남았든) 아래 줄로 제어가 돌아오므로, tcpdump가 스스로 죽기를 기다리지 않고 바로 명시적으로
+# 죽인다.
+FIFO=$(mktemp -u /tmp/tcp-recovery-live.XXXXXX)
+mkfifo "$FIFO"
+tcpdump -i "$IFACE" -l -n -S -tt --time-stamp-precision=micro "tcp port $PORT" > "$FIFO" 2>/dev/null &
+TCPDUMP_PID=$!
+
+python3 tcp-recovery/analyze_recovery.py --live --port "$PORT" --min-losses "$MIN_LOSSES" < "$FIFO"
+
+kill "$TCPDUMP_PID" 2>/dev/null || true
+rm -f "$FIFO"
