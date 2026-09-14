@@ -232,6 +232,66 @@ Checked on 2026-09-14 by running Thor as server and Orin as client with the unmo
 
 ---
 
+# Direct Ethernet Link (Thor↔Orin)
+
+## What changed
+
+The LAN cable was moved off the shared switch (where both boards previously got `192.168.196.0/24` addresses via DHCP) to a direct connection between Thor's `enP2p1s0` and the Orin's `eno1` — a dedicated point-to-point 5 Gbps link, no switch, no gateway. Both boards keep their existing Wi-Fi connections for everything else (SSH, internet).
+
+**Addressing:** `10.10.10.1` (Thor, tracked in the SD/TCP JSON configs) / `10.10.10.2` (Orin, uncommitted local override — same convention as before). Configured via NetworkManager static profiles, not a bare `ip addr add`:
+
+```bash
+sudo nmcli connection add type ethernet ifname <iface> con-name thor-orin-direct \
+    ipv4.method manual ipv4.addresses <address>/24 ipv6.method ignore
+sudo nmcli connection modify "Wired connection 1" autoconnect no   # the old DHCP profile
+```
+
+A bare `ip addr add` was tried first and got silently evicted mid-session — NetworkManager still watches the interface's carrier state even with no active profile, and a link renegotiation (in this case, `tune-latency.sh`'s `ethtool --set-eee`) was enough to make it try to reclaim the interface via DHCP, which fails on this link and leaves it addressless. The `nmcli` profile above is what actually stuck, and survives reboots.
+
+## SD start was completely broken on this link, not just slower
+
+`response_sd.sh` (the server) never set `VSOMEIP_SD_FAST_START` — only the client side (`request_sd.sh`) had it, from the earlier SD work. On the switched network this only cost ~700 µs (the netlink wait). On this link it is fatal: `routing_manager_impl::start()` waits for a netlink **default-route** event before starting SD, and a bare point-to-point `/24` with no gateway never produces one. The server sat there re-printing its version banner every 10 s, forever — `discovery_->start()` was never called, the SD multicast group was never joined, nothing was listening on port 30490. Symptom: the client logs "Network interface ... state changed: up" and then nothing else, no "Service is available" ever.
+
+Fixed by adding the same `VSOMEIP_SD_FAST_START="${VSOMEIP_SD_FAST_START:-1}"` default to `response_sd.sh`, `response_tcp.sh`, `request_tcp.sh`, and `tcp-recovery/run_experiment.sh`'s server and client launches (`request_sd.sh` already had it). **On this kind of link the variable is required for SD to work at all, not just an optimization** — worth remembering if this link is ever reused for another test script that doesn't source it.
+
+## Results
+
+**SD (`request_sd.sh`, 100 runs, `tune-latency.sh` applied on both, no kernel changes):**
+
+| | n | mean | p50 | p90 | max |
+|---|---|---|---|---|---|
+| Direct link | 99 (1 excluded) | 1193 µs | 1188 µs | 1274 µs | 1482 µs |
+| — outlier | 1 | 500,924 µs | — | — | — |
+| Wi-Fi (previous) | ~100 | ~3100 µs | — | — | — |
+
+99/100 runs landed under 1.5 ms — comfortably under the 2 ms target. The one ~501 ms outlier (run 55 of 100) looked like a single dropped/delayed FindService needing a full `repetitions_base_delay` retry cycle; not reproduced on a second, shorter run, not investigated further.
+
+**TCP packet recovery, wire-level (`tcp-recovery/analyze_recovery.py`'s `[C]`, `--cycle 5`, 1-in-8 loss, 40 s):**
+
+| | n | mean | p50 | p90 | ≤2ms |
+|---|---|---|---|---|---|
+| Direct link, untuned | 45 | 2700 µs | 574 µs | 5629 µs | 58% |
+| Direct link, + `tune_tcp_recovery.sh` | 47 | 2393 µs | 569 µs | 5625 µs | 64% |
+| Wi-Fi, + `tune_tcp_recovery.sh` (previous) | 293 | 3460 µs | 1640 µs | 6345 µs | 55% |
+
+The median more than tripled in improvement (1.64 ms → 0.57 ms) just from the link; kernel tuning still helps a bit on top of it, for the same reason as before (`rto_min`/`tcp_reordering`), but the p90/max are still pinned around 5.6 ms regardless of tuning — consistent with the earlier finding that this tail is `CONFIG_HZ=250`-quantized RACK reorder waits, which only a kernel rebuild would touch (see "What still stands between 3.46 ms and 2 ms" below — the numbers there are superseded by this section for the wire-level case, kept for the Wi-Fi comparison).
+
+**TCP packet recovery, application-level (`request_tcp.sh`'s own "패킷 유실 복구 시간" log):**
+
+| | n | mean | note |
+|---|---|---|---|
+| Direct link, untuned | 12 | 7432 µs | tight cluster, 10/12 within 7744–7808 µs |
+| Direct link, + `tune_tcp_recovery.sh` | 11 | 7782 µs | no change — see below |
+| Wi-Fi, untuned (previous) | 21 | 9737 µs | — |
+
+Barely moved despite the link and kernel tuning both improving the wire-level number substantially. The tight, near-identical clustering both before and after tuning (and regardless of link) points at something in vsomeip's own TCP send pacing (`wait_until_sent`) with a fairly fixed characteristic delay, independent of both the network and the kernel's retransmission timers — consistent with, and now further evidence for, the throughput-ceiling finding already written up in `tcp-recovery/README.md`'s "결과: 실측값 > 방법 1". Not investigated further (would mean reading vsomeip's TCP endpoint code, not host/network tuning) — flagged here as a lead for anyone who wants to push the application-level number down too.
+
+## What this doesn't change
+
+CPU/idle tuning (`tune-latency.sh`) and TCP kernel tuning (`tune_tcp_recovery.sh`) are still volatile — reset on reboot, re-apply with `sudo ./tune-latency.sh <iface>` / `sudo ./tcp-recovery/tune_tcp_recovery.sh <peer-ip>` (interface/peer auto-detected correctly on this link, since both scripts resolve via the actual route to the peer, not the default route — see the SD section's "여러 인터페이스" caveat). The NetworkManager static-IP profiles above are the one persistent change from this section.
+
+---
+
 # TCP Packet Recovery
 
 ## Goal

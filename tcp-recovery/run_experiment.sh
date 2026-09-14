@@ -154,9 +154,15 @@ PY
 $SSH "cat > /tmp/tcp-cli-runtime.json" < "$OUT/tcp-cli.json"
 
 cd "$V"
+# VSOMEIP_SD_FAST_START: required, not just an optimization, on a gateway-less direct link
+# (e.g. two boards' Ethernet ports cabled straight together, no switch) - without it SD
+# waits forever for a netlink "default route" event that such a link never produces. See
+# response_sd.sh / CHANGES_THOR.md for the full story. Override with 0 if you have a normal
+# routed network and want the original (slightly slower) startup path.
 env LD_LIBRARY_PATH=build \
     VSOMEIP_CONFIGURATION="$CONFIG_DIR/vsomeip-tcp-service.json" \
     VSOMEIP_APPLICATION_NAME=service-sample \
+    VSOMEIP_SD_FAST_START="${VSOMEIP_SD_FAST_START:-1}" \
     $SRV_BIN > "$OUT/server.log" 2>&1 &
 SVC=$!
 sleep 3
@@ -172,7 +178,7 @@ tcpdump -i "$IF" -n -tt --time-stamp-precision=micro -w "$OUT/srv.pcap" "tcp por
 # intended, successful end of the run, not a failure, but a plain `timeout` (without
 # --preserve-status) always reports 124 when it actually had to signal the process,
 # regardless of how cleanly the process itself shut down. Do not let that trip `set -e`.
-run_remote "$CLIENT_PREFIX bash -c 'cd $VSOMEIP_DIR && LD_LIBRARY_PATH=build VSOMEIP_CONFIGURATION=/tmp/tcp-cli-runtime.json VSOMEIP_APPLICATION_NAME=client-sample timeout $DUR $CLI_CMD'" \
+run_remote "$CLIENT_PREFIX bash -c 'cd $VSOMEIP_DIR && LD_LIBRARY_PATH=build VSOMEIP_CONFIGURATION=/tmp/tcp-cli-runtime.json VSOMEIP_APPLICATION_NAME=client-sample VSOMEIP_SD_FAST_START=1 timeout $DUR $CLI_CMD'" \
     > "$OUT/client.log" 2>&1 || true
 
 for p in $(pgrep -x tcpdump); do kill "$p" 2>/dev/null; done; sleep 1
