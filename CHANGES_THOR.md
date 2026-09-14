@@ -229,3 +229,76 @@ Checked on 2026-09-14 by running Thor as server and Orin as client with the unmo
 **Deployment:** both devices must run a `libvsomeip3` rebuilt from change 5 onward. With an older library, `VSOMEIP_SD_FAST_START` is silently ignored on whichever device is the client. As of 2026-09-14, Thor and Orin are both rebuilt from `931905d` and tuned with `tune-latency.sh`.
 
 **Per-device `unicast`:** the tracked JSON files carry Thor's address. The Orin keeps `192.168.196.122` as an uncommitted local change — do not commit the JSON files from the Orin.
+
+---
+
+# TCP Packet Recovery
+
+## Goal
+
+Reduce TCP packet-recovery time — defined as the interval, as observed by the **client**, from being able to tell a segment is missing to receiving the retransmitted copy — to **2 ms**, measured between Thor and the Orin over their reliable SOME/IP TCP endpoint (port 30510).
+
+## Why the previous method didn't work
+
+The method recorded in `README.md` (`sudo iptables -D INPUT -i wlo1 ... -j DROP`) had three problems, found while trying to reproduce it (2026-09-14):
+
+1. `-D` deletes a rule; it never injects loss as written.
+2. Even fixed to `-I`/`-A`, dropping on `OUTPUT` doesn't emulate wire loss: the sender's own TCP stack sees a send error and re-queues the segment as "never sent" instead of it looking like a genuinely lost segment, so the retransmission timers under test never fire correctly. Measured effect of this mistake: 0 kernel retransmits recorded; recovery deferred entirely to the *application's* request retry (hundreds of ms).
+3. Reading recovery time off Wireshark on two unsynchronized clocks doesn't define "the client noticed the loss" for lockstep traffic, and the two boards' captures disagree about what a software-level `iptables` drop even removed (the note already in this file's "유의사항" section).
+
+## New tooling: `tcp-recovery/`
+
+Replaces the manual `iptables`+Wireshark workflow. Full usage and result tables in [tcp-recovery/README.md](tcp-recovery/README.md); summary:
+
+- `tcp-recovery/inject_loss.sh` — emulates wire loss for 1-in-N first-transmissions of the server's TCP segments, by fwmark + policy routing into a dummy interface (which reports `NETDEV_TX_OK`, unlike an `iptables DROP`) instead of the real one.
+- `tcp-recovery/analyze_recovery.py` — computes recovery time from a **single server-side** `tcpdump -S -tt` capture. Key insight: the segment that lets the client notice a hole (the "trigger") and the retransmission that fills it both travel server→client over the same path, so their one-way delays cancel; `t_server(retransmit sent) - t_server(trigger sent)` equals the client-perceived recovery interval without needing clock sync between the two boards. This is the `[C]` metric it reports.
+- `tcp-recovery/tune_tcp_recovery.sh` — applies the two kernel settings found to help (below).
+- `tcp-recovery/run_experiment.sh` — orchestrates server (local) + client (SSH remote) + loss injection + capture + analysis for this project's two-board setup. Takes the SSH password only via the `SSHPASS` env var (never as literal text in a command or file) and feeds it to a remote `sudo` prompt through the SSH session's own stdin pipe, not as argv text, so it never appears in `ps` output on either host.
+
+Also required: `config/vsomeip-tcp-client.json` and `vsomeip-tcp-service.json` carried stale `unicast` addresses (`192.168.196.27` / `.103`) unrelated to either board, left over from an earlier lab setup — the server was advertising an address that doesn't exist on this host, so the client's TCP handshake went nowhere and no traffic ever reached the interface being captured. Fixed both to Thor's address (`192.168.196.246`), matching the SD JSON convention: the Orin overrides `unicast` locally to its own address, uncommitted, same as for the SD configs.
+
+### Traffic pattern matters
+
+Recovery is only observable when a segment follows the lost one, prompting a SACK. Lockstep request/response traffic (`request-sample`/`response-sample`, the `rr` mode in `run_experiment.sh`) doesn't have that — if the response is lost, the client has nothing left to send, so recovery falls back entirely to the server's RTO. Measured: 218 ms mean, 0/292 SACK-triggered.
+
+`response_tcp.sh` / `request_tcp.sh` were rewritten to run `notify-sample --cycle <ms>` / `subscribe-sample --tcp` (a periodic event stream) instead of the lockstep pair, so that loss during normal use of these two scripts is actually recoverable via SACK rather than only via RTO.
+
+## Kernel tuning (`tcp-recovery/tune_tcp_recovery.sh`)
+
+Run on the TCP **server** (the side that retransmits):
+
+```diff
++ ip route replace <client-ip>/32 dev <iface> rto_min 1ms
++ sysctl -w net.ipv4.tcp_reordering=1
+```
+
+**Why:** `rto_min` (per-route) lowers the floor under a genuinely timer-driven recovery (kernel default 200 ms) — it only matters when no SACK ever arrives (lockstep traffic, or the last segment of a burst), not the common SACK path. `tcp_reordering` (global sysctl, affects every TCP connection on the host) lowers the number of duplicate-SACK signals RACK waits for before declaring a segment lost instead of merely reordered; on a link that doesn't reorder packets, that wait is pure latency with no benefit. Both settings are volatile and reversible; the script prints the revert commands.
+
+**Measured** (Thor server → Orin client over Wi-Fi, 5 ms-cycle SOME/IP events, 1-in-8 first-transmissions lost, `[C]` = client-perceived recovery time):
+
+| Setting | mean | p50 | n |
+|---|---|---|---|
+| default | 6.51 ms | 1.90 ms | 292 |
+| + `rto_min 1ms` | 4.07 ms | 2.11 ms | 273 |
+| + `rto_min 1ms` + `tcp_reordering=1` | **3.46 ms** | **1.64 ms** | 293 |
+
+## What still stands between 3.46 ms and 2 ms
+
+Breaking down the best-case 3.46 ms:
+
+| Component | Mean contribution |
+|---|---|
+| Wi-Fi round trip | 1.47 ms |
+| Server reacted immediately (61% of retransmits, `[B]` ≤100 µs) | ≈0 |
+| Server waited 3–10 ms (RACK reorder timer, kernel-tick-quantized) | 1.61 ms |
+| TLP/RTO (already suppressed by `rto_min 1ms`) | 0.28 ms |
+
+Two things neither script touches:
+
+1. **`CONFIG_HZ=250` on both boards.** Most of the 3–10 ms RACK wait looks like tick rounding. A `CONFIG_HZ=1000` rebuild would plausibly bring this to ~1.8 ms, but a kernel rebuild on this physical hardware is hard to reverse and risks a failed boot — not attempted without explicit approval.
+2. **The Orin is on Wi-Fi.** Same root cause as the SD latency above; a wired Orin measured 0.24 ms RTT on this LAN vs. 1.5–1.9 ms over Wi-Fi.
+
+## Rejected/not applicable
+
+- `iptables` `OUTPUT` `DROP` for loss injection — see "Why the previous method didn't work" above.
+- `tc netem loss` — `sch_netem` is not built into either board's kernel (`modinfo sch_netem` fails on both), and rebuilding a kernel module is out of scope for a test harness.

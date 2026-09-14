@@ -81,27 +81,40 @@ make examples
 
 **TCP 패킷 복구 시간**
 
-1. 앞선 `iptables` 커맨드로 인위적 패킷 손실 환경 만들기
+> 2026-09 기준, 아래의 수동 `iptables`+Wireshark 방식은 [tcp-recovery/](tcp-recovery/)의 도구로
+> 대체됐다. 기존 방식의 `-D`(삭제 옵션이라 유실이 주입되지 않음)·`OUTPUT` DROP(TCP가 "안 보낸 것"으로
+> 처리해 재전송 타이머를 타지 않음)·캡처 위치 문제를 [tcp-recovery/README.md](tcp-recovery/README.md)
+> "왜 새로 만들었나"에 정리해 뒀다. 사용법도 그쪽 문서 참고. 아래는 과거 기록.
+
+1. ~~앞선 `iptables` 커맨드로 인위적 패킷 손실 환경 만들기~~ → `sudo tcp-recovery/inject_loss.sh start <서버 IP> <클라이언트 IP>`
 2. 한 대의 보드에서 `./response_tcp.sh` 스크립트 실행으로 응답 대기
 3. 다른 보드에서 `./request_tcp.sh` 스크립트 실행으로 SD 과정 없이 바로 TCP 메시지 통신 시작
-4. 10% 확률로 랜덤하게 패킷 손실이 발생 시 TCP 프로토콜 내에 내장된 로직으로 패킷 손실 복구 과정 진행
-5. wireshark 툴을 활용하여 해당 패킷 복구 소요 시간 측정
-6. 패킷 손실이 10번 발생할 때까지 실험 진행 후 10회 내에서 모두 통과하는지 최종 확인
+4. 패킷 손실이 발생 시 TCP 프로토콜 내에 내장된 로직으로 패킷 손실 복구 과정 진행
+5. ~~wireshark 툴을 활용하여 해당 패킷 복구 소요 시간 측정~~ → `python3 tcp-recovery/analyze_recovery.py`가 서버 쪽 캡처 하나로 자동 계산 (두 보드의 시계를 맞출 필요 없음 - 원리는 tcp-recovery/README.md 참고)
+6. `sudo tcp-recovery/inject_loss.sh stop <서버 IP> <클라이언트 IP>`로 유실 주입 해제
 
 ```bash
-./response_tcp.sh # 왼쪽 orin
-
-sudo iptables -D INPUT -i wlo1 -m statistic --mode random --probability 0.1 -j DROP # request 후 응답을 받을 때 10% 확률로 패킷 유실, 재전송으로 인한 복구 과정
-./request_tcp.sh # 오른쪽 orin에서 2가지 커맨드 실행
+sudo ./tcp-recovery/tune_tcp_recovery.sh <클라이언트 IP>   # 선택 사항 - 아래 "테스트 결과" 참고
+sudo ./tcp-recovery/run_experiment.sh test1 stream 5 60 \
+    --server-ip <서버 IP> --client-ip <클라이언트 IP> \
+    --client-host <user>@<클라이언트 IP> --client-sudo
 ```
+
+`response_tcp.sh`/`request_tcp.sh`는 이제 `tcp-recovery/run_experiment.sh`가 직접 구동하는
+`notify-sample`/`subscribe-sample` 조합(유실 뒤로도 트래픽이 이어지는 이벤트 스트림 - 왜 이 조합이어야
+하는지도 tcp-recovery/README.md 참고)을 수동으로 실행할 때 쓰는 얇은 래퍼로 남겨뒀다.
 
 ### 테스트 결과
 
-| **지표**                  | **최적화 전** | **1차 최적화** |
-|--------------------------|---------------|---------------|
-| 서비스 디스커버리 시간   | 평균 20ms    | 평균 4ms |
-| TCP 패킷 복구 시간       | 평균 10ms    | 평균 4ms |
+| **지표**                  | **최적화 전** | **1차 최적화** | **2차 최적화 (2026-09)** |
+|--------------------------|---------------|---------------|---------------------------|
+| 서비스 디스커버리 시간   | 평균 20ms    | 평균 4ms      | 평균 2.5~3ms (Wi-Fi 링크가 병목 - [CHANGES_THOR.md](CHANGES_THOR.md) 참고) |
+| TCP 패킷 복구 시간       | 평균 10ms    | 평균 4ms      | 평균 3.46ms / 중앙값 1.64ms ([tcp-recovery/](tcp-recovery/) 참고) |
 
+TCP 패킷 복구 2차 수치는 `tcp-recovery/tune_tcp_recovery.sh` 적용 후, 클라이언트 기준 복구 시간
+(`analyze_recovery.py`의 `[C]`) 기준. 1차 수치("평균 4ms")는 위에서 설명한 측정 방법의 결함(특히
+`OUTPUT` DROP이 실제로는 선로 유실을 흉내내지 못하는 문제) 때문에 재현되지 않는다 - 같은 결함이 있는
+방법으로 잰 값이라 2차 수치와 직접 비교하기는 어렵다.
 
 ### config
 
@@ -113,16 +126,26 @@ sudo iptables -D INPUT -i wlo1 -m statistic --mode random --probability 0.1 -j D
 
 ### 유의사항
 
-- `iptables`를 통한 패킷 로스는 소프트웨어 레벨로 구현이 되어있지만 wireshark는 하드웨어 레벨에서 패킷을 관찰하기에 둘 간의 패킷 불일치 발생
+- ~~`iptables`를 통한 패킷 로스는 소프트웨어 레벨로 구현이 되어있지만 wireshark는 하드웨어 레벨에서 패킷을 관찰하기에 둘 간의 패킷 불일치 발생~~ →
+  `tcp-recovery/inject_loss.sh`는 `iptables OUTPUT DROP`이 아니라 dummy 인터페이스로의 정책 라우팅을 쓴다(자세한 이유는
+  [tcp-recovery/README.md](tcp-recovery/README.md) 참고). 캡처와 분석을 서버 쪽 tcpdump 하나로 통일해서 두 장비 간
+  불일치 문제 자체를 없앴다.
 - 데스크탑에서 잘 돌아가던 코드가 orin에서 테스트할 시 안 되던 케이스가 있었기에 script에 보면 코드, config에 일관성이 없는 문제가 있음
   - SD 과정 없이 IP를 고정으로 TCP 통신하는 config, 별도의 tcp application 코드가 동작하지 않음 등
+  - (2026-09) `config/vsomeip-tcp-client.json`·`vsomeip-tcp-service.json`의 `unicast`가 이 보드들과 무관한 옛 IP
+    (`192.168.196.27`/`.103`)로 남아있던 것도 이 문제의 사례 - SD 설정과 같은 방식으로 Thor의 실제 IP로 맞춰뒀다.
+    Orin에서 쓸 때는 SD 설정과 마찬가지로 자기 IP를 로컬(비커밋) 변경으로 덮어써야 한다 ([CHANGES_THOR.md](CHANGES_THOR.md)
+    "Per-device unicast" 참고).
 
 
 ---
 ## 3. 향후 과제
 
+- (2026-09 갱신) TCP 패킷 복구는 무엇을 바꿔야 하는지 찾았다 - `tcp-recovery/` 참고. 2ms까지 남은 구간은
+  두 가지로 좁혀졌다: 커널 틱(`CONFIG_HZ=250`, `CONFIG_HZ=1000`으로 재빌드 시 이론상 ~1.8ms 추정이지만
+  실물 하드웨어 커널 재빌드라 시도하지 않음)과 Orin이 Wi-Fi라는 점(유선 홉은 0.24ms). 자세한 분해는
+  [tcp-recovery/README.md](tcp-recovery/README.md) "2ms까지 남은 구간" 참고.
 - config를 통한 시간 단축, TCP 프로토콜 내에서 할 수 있는 테스트는 다 해봤기에 SOME/IP 내용 이해 후 SomeIP를 구현한 vSomeIP 코드 내에서  C++ 코드 최적화 과정 진행 필요
-- TCP 패킷 복구는 어떤 부분을 바꿔야할 지 아직 미정. TCP 프로토콜 자체를 재설계하는 건 시간, 안정성이 너무 걸릴 것으로 판단하여 보류
 
 
 ---
