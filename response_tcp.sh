@@ -33,5 +33,8 @@ fi
 export LD_LIBRARY_PATH="build:$LD_LIBRARY_PATH"
 export VSOMEIP_CONFIGURATION="config/vsomeip-tcp-service.json"
 export VSOMEIP_APPLICATION_NAME="service-sample"
+# 게이트웨이 없는 직결 링크에서는 netlink의 "기본 라우트" 이벤트가 오지 않아 이게 없으면 SD 자체가
+# 시작되지 않는다 (response_sd.sh 참고). 끄려면: sudo VSOMEIP_SD_FAST_START=0 ./response_tcp.sh ...
+export VSOMEIP_SD_FAST_START="${VSOMEIP_SD_FAST_START:-1}"
 
 build/examples/response-tcp-recovery --cycle "$CYCLE"

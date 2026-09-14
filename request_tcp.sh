@@ -16,6 +16,9 @@
 export LD_LIBRARY_PATH="build:$LD_LIBRARY_PATH"
 export VSOMEIP_CONFIGURATION="config/vsomeip-tcp-client.json"
 export VSOMEIP_APPLICATION_NAME="client-sample"
+# 게이트웨이 없는 직결 링크에서는 netlink의 "기본 라우트" 이벤트가 오지 않아 이게 없으면 SD 자체가
+# 시작되지 않는다 (response_sd.sh 참고). 끄려면: VSOMEIP_SD_FAST_START=0 ./request_tcp.sh ...
+export VSOMEIP_SD_FAST_START="${VSOMEIP_SD_FAST_START:-1}"
 
 CYCLE="${1:-5}"
 THRESHOLD="${2:-2.0}"
