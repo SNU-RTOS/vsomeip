@@ -4,13 +4,16 @@
 export LD_LIBRARY_PATH="build:$LD_LIBRARY_PATH"
 export VSOMEIP_CONFIGURATION="config/vsomeip-udp-client.json"
 export VSOMEIP_APPLICATION_NAME="client-sample"
+# ST_REGISTERED 직후 netlink 응답을 기다리지 않고 SD 시작 (routing_manager_impl::start 참고)
+# 끄고 비교하려면: VSOMEIP_SD_FAST_START=0 ./request_sd.sh
+export VSOMEIP_SD_FAST_START="${VSOMEIP_SD_FAST_START:-1}"
 
 BINARY_PATH="build/examples/request-sd"
 
 total_time=0
 count=0
 
-for i in {1..10}
+for i in {1..100}
 do
     # 바이너리 실행, 출력은 임시 파일에 저장
     $BINARY_PATH > temp_output.txt 2>&1 &
