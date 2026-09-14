@@ -30,10 +30,16 @@
 // `--threshold` times the configured `--cycle` as such a stall and logs the estimated
 // recovery time for it.
 //
-// This is an application-level estimate, not a wire-level measurement: it includes
-// vsomeip's own receive-side processing (see the SD latency writeup for the size of that -
-// tens to a few hundred µs) on top of the network recovery time proper. For a wire-level
-// cross-check against this number, see tcp-recovery/analyze_recovery.py.
+// This is an application-level estimate, not a wire-level measurement: besides the network
+// recovery time proper, it includes vsomeip's own receive-side processing (tens to a few
+// hundred µs, see the SD latency writeup) AND, at a demanding cycle on a lossy/slow link,
+// vsomeip's own TCP send-side pacing on the SERVER (its `wait_until_sent` flow control,
+// implementation/endpoints/src/tcp_server_endpoint_impl.cpp) - measured on Wi-Fi at
+// --cycle 5, throughput was capped around 30 msg/s (vs. the nominal 200 msg/s) even with
+// no loss injected at all, so at that cycle most of a flagged gap is this pacing, not
+// packet loss. Always run a NO_DROP=1 baseline first (see response_tcp.sh) to see what
+// gaps look like on your link with nothing injected, and pick --threshold accordingly. For
+// a wire-level cross-check unaffected by any of this, see tcp-recovery/analyze_recovery.py.
 class client_sample {
 public:
     client_sample(uint32_t _cycle, double _threshold)

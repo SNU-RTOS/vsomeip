@@ -84,34 +84,39 @@ make examples
 > 2026-09 기준, 아래의 수동 `iptables`+Wireshark 방식은 [tcp-recovery/](tcp-recovery/)의 도구로
 > 대체됐다. 기존 방식의 `-D`(삭제 옵션이라 유실이 주입되지 않음)·`OUTPUT` DROP(TCP가 "안 보낸 것"으로
 > 처리해 재전송 타이머를 타지 않음)·캡처 위치 문제를 [tcp-recovery/README.md](tcp-recovery/README.md)
-> "왜 새로 만들었나"에 정리해 뒀다. 사용법도 그쪽 문서 참고. 아래는 과거 기록.
+> "왜 새로 만들었나"에 정리해 뒀다. 아래는 과거 기록이자, 지금도 유효한 절차의 개요.
 
-1. ~~앞선 `iptables` 커맨드로 인위적 패킷 손실 환경 만들기~~ → `sudo tcp-recovery/inject_loss.sh start <서버 IP> <클라이언트 IP>`
-2. 한 대의 보드에서 `./response_tcp.sh` 스크립트 실행으로 응답 대기
-3. 다른 보드에서 `./request_tcp.sh` 스크립트 실행으로 SD 과정 없이 바로 TCP 메시지 통신 시작
-4. 패킷 손실이 발생 시 TCP 프로토콜 내에 내장된 로직으로 패킷 손실 복구 과정 진행
-5. ~~wireshark 툴을 활용하여 해당 패킷 복구 소요 시간 측정~~ → `python3 tcp-recovery/analyze_recovery.py`가 서버 쪽 캡처 하나로 자동 계산 (두 보드의 시계를 맞출 필요 없음 - 원리는 tcp-recovery/README.md 참고)
-6. `sudo tcp-recovery/inject_loss.sh stop <서버 IP> <클라이언트 IP>`로 유실 주입 해제
+SD 측정(`response_sd.sh`/`request_sd.sh`)과 같은 방식으로, 두 보드에서 스크립트 하나씩만 실행한다 - 둘
+사이에 SSH가 필요 없다. `request_tcp.sh` 쪽 화면에 뜨는 `패킷 유실 복구 시간: Xus` 줄이 `request-sd.cpp`의
+"매칭까지 처리 시간"과 같은 방식으로 **클라이언트 자신이 직접 잰** 값이다.
 
 ```bash
-sudo ./tcp-recovery/tune_tcp_recovery.sh <클라이언트 IP>   # 선택 사항 - 아래 "테스트 결과" 참고
-sudo ./tcp-recovery/run_experiment.sh test1 stream 5 60 \
-    --server-ip <서버 IP> --client-ip <클라이언트 IP> \
-    --client-host <user>@<클라이언트 IP> --client-sudo
+./response_tcp.sh # 서버 - sudo로 실행, 유실 주입도 여기서 관리
+./request_tcp.sh  # 클라이언트
 ```
 
-`response_tcp.sh`/`request_tcp.sh`는 이제 `tcp-recovery/run_experiment.sh`가 직접 구동하는
-`notify-sample`/`subscribe-sample` 조합(유실 뒤로도 트래픽이 이어지는 이벤트 스트림 - 왜 이 조합이어야
-하는지도 tcp-recovery/README.md 참고)을 수동으로 실행할 때 쓰는 얇은 래퍼로 남겨뒀다.
+1. `./response_tcp.sh` 스크립트를 서버에서 sudo로 실행 → 이벤트 발행 시작, 유실 주입도 같이 관리
+2. 클라이언트에서 `./request_tcp.sh` 실행 → 구독 시작
+3. 패킷 손실이 발생 시 TCP 프로토콜 내에 내장된 로직으로 패킷 손실 복구 과정 진행
+4. 손실 후 수신 간격이 정상 주기의 2배(기본값)를 넘으면 클라이언트가 직접 "패킷 유실 복구 시간"을 로그로 출력
+
+서버 쪽 tcpdump 캡처 하나로 두 보드의 시계 동기화 없이 와이어 레벨로 교차검증하려면
+`tcp-recovery/run_experiment.sh`(SSH 자동화) 또는 `tcp-recovery/inject_loss.sh`+`analyze_recovery.py`를
+직접 조합해서 쓴다 - 두 방법의 차이와 사용법은 tcp-recovery/README.md 참고.
 
 ### 테스트 결과
 
 | **지표**                  | **최적화 전** | **1차 최적화** | **2차 최적화 (2026-09)** |
 |--------------------------|---------------|---------------|---------------------------|
 | 서비스 디스커버리 시간   | 평균 20ms    | 평균 4ms      | 평균 2.5~3ms (Wi-Fi 링크가 병목 - [CHANGES_THOR.md](CHANGES_THOR.md) 참고) |
-| TCP 패킷 복구 시간       | 평균 10ms    | 평균 4ms      | 평균 3.46ms / 중앙값 1.64ms ([tcp-recovery/](tcp-recovery/) 참고) |
+| TCP 패킷 복구 시간       | 평균 10ms    | 평균 4ms      | 평균 3.46ms(와이어 레벨) / 평균 9.7ms(애플리케이션 레벨, 튜닝 전) ([tcp-recovery/](tcp-recovery/) 참고) |
 
-TCP 패킷 복구 2차 수치는 `tcp-recovery/tune_tcp_recovery.sh` 적용 후, 클라이언트 기준 복구 시간
+2차 수치가 두 개인 이유: `request_tcp.sh`(방법 1)는 클라이언트 애플리케이션이 직접 재는 "체감" 값이라
+vsomeip 자신의 처리 시간과 서버 쪽 TCP 송신 페이싱까지 섞여 있고, `tcp-recovery/analyze_recovery.py`
+(방법 2)는 tcpdump로 잡은 순수 와이어 레벨 값이다. 자세한 내용과 커널 튜닝 적용 시 수치는
+[tcp-recovery/README.md](tcp-recovery/README.md) "결과: 실측값" 참고.
+
+TCP 패킷 복구 2차 수치(와이어 레벨)는 `tcp-recovery/tune_tcp_recovery.sh` 적용 후, 클라이언트 기준 복구 시간
 (`analyze_recovery.py`의 `[C]`) 기준. 1차 수치("평균 4ms")는 위에서 설명한 측정 방법의 결함(특히
 `OUTPUT` DROP이 실제로는 선로 유실을 흉내내지 못하는 문제) 때문에 재현되지 않는다 - 같은 결함이 있는
 방법으로 잰 값이라 2차 수치와 직접 비교하기는 어렵다.

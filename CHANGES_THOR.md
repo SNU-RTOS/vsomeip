@@ -257,11 +257,33 @@ Replaces the manual `iptables`+Wireshark workflow. Full usage and result tables 
 
 Also required: `config/vsomeip-tcp-client.json` and `vsomeip-tcp-service.json` carried stale `unicast` addresses (`192.168.196.27` / `.103`) unrelated to either board, left over from an earlier lab setup — the server was advertising an address that doesn't exist on this host, so the client's TCP handshake went nowhere and no traffic ever reached the interface being captured. Fixed both to Thor's address (`192.168.196.246`), matching the SD JSON convention: the Orin overrides `unicast` locally to its own address, uncommitted, same as for the SD configs.
 
+### Per-device scripts with direct client-side logging
+
+The SSH-orchestrated `run_experiment.sh` above works, but the reference workflow is now the same two-script model as SD: `response_tcp.sh` started on the server, `request_tcp.sh` started on the client, no SSH between them (`run_experiment.sh` is kept as a secondary, wire-level cross-check).
+
+`examples/response-tcp-recovery.cpp` and `examples/request-tcp-recovery.cpp` were rewritten (previously a lockstep dual-service echo responder, unrelated to this test) into a matched pair:
+
+- **Server:** publishes an 8-byte sequence counter over TCP every `--cycle` ms, incrementing by one each send. Offers the service exactly once for the whole run — unlike `notify-sample`'s periodic `stop_offer`/re-offer cycle, which would itself create gaps in the stream indistinguishable from a lost segment.
+- **Client:** subscribes to that counter and times recovery the same way `request-sd.cpp` measures SD latency — directly, from its own timestamps. TCP delivers every byte reliably and in order, so a lost segment never shows up as a missing message, only as an unusually long pause before the next one arrives (the connection stalls until the retransmission lands, then vsomeip delivers the backlog). The client flags any inter-arrival gap past `--threshold × --cycle` (default 2×) as such a stall and logs it via `VSOMEIP_WARNING`:
+
+  ```
+  패킷 유실 복구 시간: 9946us (수신 간격=14946us, 정상 주기=5000us, seq 1749 -> 1750)
+  ```
+
+`response_tcp.sh` now manages loss injection itself via `tcp-recovery/inject_loss.sh` (`NO_DROP=1` to disable), so starting it is the only setup needed on the server side.
+
+**This number is an application-level estimate, not a wire-level one** — see [tcp-recovery/README.md](tcp-recovery/README.md#결과-실측값) "방법 1" for the full breakdown. Measured on Thor (server, wired) → Orin (client, Wi-Fi), `--cycle 5`, 1-in-8 first-transmissions lost, no kernel tuning:
+
+| | n | mean | p50 |
+|---|---|---|---|
+| Loss injected | 21 | 9.7 ms | 9.6 ms |
+| `NO_DROP=1` baseline (natural jitter) | 2 / 594 (0.3%) | 7.2–8.5 ms range | — |
+
+This is well above `tune_tcp_recovery.sh`'s wire-level 3.46 ms because, at this cycle, most of the gap is not network recovery at all: even with **zero loss injected**, only 594 of the ~4000 events expected at a 5 ms cycle over 20 s arrived — the server log shows `wait_until_sent: Maximum wait time for send operation exceeded`, confirming vsomeip's own TCP send-side flow control (`tcp_server_endpoint_impl::connection::wait_until_sent`) is throttling publication to what this Wi-Fi link can actually sustain, independent of the injected loss. A useful finding in its own right, and a reason to always run a `NO_DROP=1` baseline before trusting flagged events at a given `--cycle`.
+
 ### Traffic pattern matters
 
-Recovery is only observable when a segment follows the lost one, prompting a SACK. Lockstep request/response traffic (`request-sample`/`response-sample`, the `rr` mode in `run_experiment.sh`) doesn't have that — if the response is lost, the client has nothing left to send, so recovery falls back entirely to the server's RTO. Measured: 218 ms mean, 0/292 SACK-triggered.
-
-`response_tcp.sh` / `request_tcp.sh` were rewritten to run `notify-sample --cycle <ms>` / `subscribe-sample --tcp` (a periodic event stream) instead of the lockstep pair, so that loss during normal use of these two scripts is actually recoverable via SACK rather than only via RTO.
+Recovery is only observable when a segment follows the lost one, prompting a SACK. Lockstep request/response traffic (`request-sample`/`response-sample`, the `rr` mode in `run_experiment.sh`) doesn't have that — if the response is lost, the client has nothing left to send, so recovery falls back entirely to the server's RTO. Measured: 218 ms mean, 0/292 SACK-triggered. `request-tcp-recovery`/`response-tcp-recovery` have no lockstep option at all — the server always publishes a continuous stream — so this failure mode doesn't apply to the per-device scripts above; `run_experiment.sh`'s `stream` mode uses the same style of continuous traffic (`notify-sample`/`subscribe-sample`) for the same reason, keeping `rr` mode only as a demonstration of the failure mode.
 
 ## Kernel tuning (`tcp-recovery/tune_tcp_recovery.sh`)
 

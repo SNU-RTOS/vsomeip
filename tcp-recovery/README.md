@@ -2,15 +2,29 @@
 
 `response_tcp.sh` / `request_tcp.sh`로 하던 기존 측정 방식(수동 `iptables`, Wireshark로 눈으로 확인)을
 대체하는 도구 모음. 목표는 "클라이언트가 패킷 유실을 인식한 시점부터 서버가 재전송한 패킷을 받기까지의
-시간"을 자동으로, 재현 가능하게, 두 장비의 시계 동기화 없이 측정하는 것.
+시간"을 자동으로, 재현 가능하게 측정하는 것.
 
-- [inject_loss.sh](inject_loss.sh) - 선로 패킷 유실을 흉내내는 도구 (start/stop)
-- [analyze_recovery.py](analyze_recovery.py) - 서버 쪽 tcpdump 캡처 하나로 복구 시간을 계산
-- [tune_tcp_recovery.sh](tune_tcp_recovery.sh) - 복구 시간을 줄이는 커널 설정 적용
-- [run_experiment.sh](run_experiment.sh) - 위 세 가지를 묶어 서버(로컬)+클라이언트(SSH 원격) 실험을 한 번에 실행
+## 두 가지 방법
 
-세 도구는 독립적으로도 쓸 수 있다. `run_experiment.sh`는 이 프로젝트의 Thor↔Orin 2대 구성을 위한 편의
-스크립트일 뿐이다.
+**1. 기본 - 양쪽에서 스크립트 하나씩 (SD 측정과 같은 방식).** 서버(예: Thor)에서 `response_tcp.sh`,
+클라이언트(예: Orin)에서 `request_tcp.sh`를 각자 실행한다. 둘 사이에 SSH가 필요 없다.
+`request_tcp.sh` 쪽 화면/로그에 뜨는 `패킷 유실 복구 시간: Xus` 줄이 바로 그 값이다 - `request-sd.cpp`가
+"매칭까지 처리 시간"을 찍는 것과 같은 방식으로, **클라이언트 자신이 직접 잰다.**
+
+**2. 교차검증 - 서버 쪽 tcpdump 캡처 하나로 계산 (시계 동기화 불필요).** 아래 도구들:
+
+- [inject_loss.sh](inject_loss.sh) - 선로 패킷 유실을 흉내내는 도구 (start/stop). 1번 방법에서도
+  `response_tcp.sh`가 내부적으로 이걸 쓴다.
+- [analyze_recovery.py](analyze_recovery.py) - 서버 쪽 tcpdump 캡처 하나로 복구 시간을 계산 (원리는
+  아래 "왜 서버 캡처만으로 되나" 참고)
+- [tune_tcp_recovery.sh](tune_tcp_recovery.sh) - 복구 시간을 줄이는 커널 설정 적용 (양쪽 방법 공통)
+- [run_experiment.sh](run_experiment.sh) - `inject_loss.sh`+캡처+`analyze_recovery.py`를 SSH로 묶어
+  한 번에 실행하는 편의 스크립트 (이 프로젝트의 Thor↔Orin 구성 전용)
+
+**둘의 차이:** 1번은 클라이언트 애플리케이션이 직접 재는 값이라 vsomeip 자신의 수신측 처리, 그리고 부담이
+큰 주기에서는 **서버 쪽 TCP 송신 페이싱**(`wait_until_sent`, 아래 "알려진 한계" 참고)까지 포함된
+"체감" 값이다. 2번은 tcpdump로 잡은 TCP 세그먼트만 보는 순수 와이어 레벨 값이라 더 정밀하지만, 서버 쪽에
+tcpdump를 따로 띄워야 한다. **둘 다 필요할 때만 쓰면 된다 - 1번이 기본, 이상하다 싶으면 2번으로 대조.**
 
 ## 왜 새로 만들었나
 
@@ -24,7 +38,7 @@
 3. **Wireshark 수동 측정**은 캡처 위치가 netfilter보다 앞이라 실제로 유실된 패킷도 화면에 보이고, 두
    장비의 시계가 다르면 "클라이언트 인식 시점"을 정의할 방법이 없다.
 
-## 핵심 아이디어: 클라이언트 쪽 복구 시간을 서버 캡처 하나로 계산하기
+## 왜 서버 캡처만으로 되나 (2번 방법의 핵심 아이디어)
 
 "클라이언트가 유실을 인식한 시점 → 복구 패킷을 받은 시점"은 클라이언트 쪽에서 재야 할 것 같지만, 실제로는
 **서버 쪽 캡처 하나로 계산할 수 있다.**
@@ -39,25 +53,31 @@
 
 ## 사용법
 
-### 1. 빠른 시작 (Thor=서버, Orin=클라이언트, 이 저장소 그대로)
+### 1. 기본 - 양쪽에서 스크립트 하나씩
 
 ```bash
-# Thor에서, TCP 서버(SOME/IP 이벤트 발행자)를 시작
-sudo ./tcp-recovery/tune_tcp_recovery.sh <Orin의 IP>   # 선택 사항, 아래 "결과" 참고
-sudo ./tcp-recovery/run_experiment.sh test1 stream 5 60 \
-    --server-ip <Thor의 IP> --client-ip <Orin의 IP> \
-    --client-host <user>@<Orin의 IP> --client-sudo --vsomeip-dir /workspace/vsomeip
+# 서버 (예: Thor) - sudo 필요 (유실 주입에 iptables/ip route를 쓴다)
+sudo ./response_tcp.sh <클라이언트 IP> [주기ms=5] [1/N 유실=8]
+
+# 클라이언트 (예: Orin) - sudo 불필요
+./request_tcp.sh [주기ms=5] [임계배수=2.0]
 ```
 
-`--client-sudo`는 원격(Orin)의 vsomeip 체크아웃이 root 소유일 때만 필요하다. SSH 로그인은 키 기반을
-권장하며(`ssh-copy-id <client-host>`), 안 되어 있으면 `export SSHPASS=...` 후 `sudo -E`로 실행한다 -
-**비밀번호를 파일이나 명령행에 직접 적지 말 것.** 자세한 내용은 [run_experiment.sh](run_experiment.sh)의
-상단 주석 참고.
+클라이언트 화면에 이렇게 뜬다:
 
-끝나면 결과가 `tcp-recovery/results/test1/`에 남고, `analyze_recovery.py`의 출력이 화면에 바로 찍힌다.
-이 디렉터리는 `.gitignore`에 등록되어 있다 - 커밋하지 말 것.
+```
+첫 이벤트 수신, seq=1748
+[loss] seq 1749 -> 1750: 복구 시간 9946us (수신 간격 14946us)
+...
+총 수신 587건, 유실/지연 감지 21건
+```
 
-### 2. 직접 조합해서 쓰기 (다른 두 장비, 다른 트래픽 패턴)
+**먼저 기준선을 확인할 것.** `NO_DROP=1 sudo ./response_tcp.sh <클라이언트 IP>`로 유실 주입 없이 돌려서
+이 링크에서 평소 수신 간격이 얼마나 벌어지는지 본 다음(자연스러운 지터), `--threshold`(기본 2.0배)가 그보다
+확실히 높은지 확인한다. 이 프로젝트의 Wi-Fi 링크·5ms 주기 조합에서는 유실 없이도 594건 중 2건(0.3%)이
+10ms(=2×5ms) 문턱을 넘었다 - 자세한 수치와 원인은 아래 "결과: 실측값" 참고.
+
+### 2. 교차검증 - 직접 조합해서 쓰기 (다른 두 장비, 다른 트래픽 패턴)
 
 ```bash
 # 1) 서버 실행 (평가하려는 실제 SOME/IP 서버, 또는 notify-sample 같은 예제)
@@ -81,6 +101,12 @@ python3 ./tcp-recovery/analyze_recovery.py --capture cap.txt --port <포트>
 **주의:** `analyze_recovery.py`는 `-S`(절대 시퀀스 번호)와 `-tt`(epoch, 마이크로초) 옵션으로 만든 텍스트
 캡처가 필요하다. 상대 시퀀스 번호로는 구멍(hole) 탐지 로직이 의미가 없어진다.
 
+이 프로젝트의 Thor↔Orin 2대 구성이라면 1)~4)를 SSH로 자동화한
+[run_experiment.sh](run_experiment.sh)를 대신 써도 된다 (`--client-sudo`는 원격의 vsomeip 체크아웃이
+root 소유일 때만 필요; SSH 로그인은 키 기반 권장, 안 되어 있으면 `export SSHPASS=...` 후 `sudo -E`로 실행 -
+**비밀번호를 파일이나 명령행에 직접 적지 말 것**, 자세한 내용은 스크립트 상단 주석 참고). 결과는
+`tcp-recovery/results/<라벨>/`에 남는다 (`.gitignore`에 등록되어 있음 - 커밋하지 말 것).
+
 ### 트래픽 패턴이 중요하다
 
 **유실 뒤에 다른 세그먼트가 이어서 오지 않으면 클라이언트는 유실을 알 방법이 없다.** 한 번에 하나씩
@@ -88,11 +114,39 @@ python3 ./tcp-recovery/analyze_recovery.py --capture cap.txt --port <포트>
 - 응답이 유실되면 클라이언트는 다음에 보낼 것이 없어 SACK을 만들 수 없고, 복구는 전적으로 서버의
 재전송 타이머(RTO)에만 의존한다. 실측 218ms.
 
-`run_experiment.sh`의 `stream` 모드(`notify-sample`/`subscribe-sample`, 주기적 이벤트 스트림)처럼
-유실 뒤로도 트래픽이 계속 이어지는 패턴이어야 SACK 기반 빠른 재전송이 동작해서 의미 있는 숫자가 나온다.
-`rr` 모드(요청-응답)는 경로 점검용으로만 남겨뒀다.
+`request-tcp-recovery`/`response-tcp-recovery`(방법 1)는 처음부터 유실 뒤로도 계속 이어지는 주기적
+이벤트 스트림이라 이 문제가 없다 - 서버가 매 주기 시퀀스 번호를 담은 이벤트를 계속 발행하고, 클라이언트는
+그 도착 간격을 본다 (락스텝 옵션 자체가 없음). `run_experiment.sh`(방법 2)의 `stream` 모드도 동일한
+이유로 같은 패턴(`notify-sample`/`subscribe-sample`)을 쓴다. `rr` 모드(요청-응답 락스텝)는 이 문제를
+직접 보여주는 경로 점검용으로만 남겨뒀다.
 
-## 결과 해석
+## 결과: 실측값
+
+### 방법 1 (클라이언트 자체 로그, 애플리케이션 레벨)
+
+Thor(서버, 유선) → Orin(클라이언트, Wi-Fi), `--cycle 5`, 최초 전송의 1/8을 유실시킨 실측 (튜닝 없음):
+
+| | n | mean | p50 | min | max |
+|---|---|---|---|---|---|
+| 유실 주입 (`복구 시간`) | 21 | 9.7ms | 9.6ms | 6.8ms | 17.3ms |
+| 유실 없음 기준선 (`NO_DROP=1`, 자연 지터) | 2 / 594건 (0.3%) | - | - | 7.2ms | 8.5ms |
+
+방법 2의 [C](아래, 튜닝 후 3.46ms)보다 눈에 띄게 높다. 이유는 두 가지가 겹쳐서다.
+
+1. **이 값은 vsomeip 자신의 수신측 처리 시간을 포함한다** (방법 2는 순수 와이어 레벨).
+2. **더 크게는, `--cycle 5`에서 vsomeip 서버 쪽 TCP 송신 자체가 이 Wi-Fi 링크의 한계에 부딪힌다.**
+   유실을 전혀 주입하지 않아도 20초에 594건(초당 ~30건)만 도착했다 - 요청한 주기(초당 200건)의 15%
+   수준이다. 서버 로그에 `wait_until_sent: Maximum wait time for send operation exceeded`가 찍히는데,
+   이건 vsomeip의 TCP 송신측 흐름 제어(`implementation/endpoints/src/tcp_server_endpoint_impl.cpp`의
+   `wait_until_sent`)가 실제로 작동하고 있다는 뜻이다. 즉 `--cycle 5`에서는 클라이언트가 보는 지연 간격의
+   상당 부분이 "이 세그먼트가 유실→재전송됐다"가 아니라 "서버가 이전 데이터가 다 나갈 때까지 다음 이벤트
+   발행 자체를 늦췄다"는 뜻일 수 있다. **주기를 넉넉하게 잡거나(예: 20~50ms), 처리량이 정상인지
+   (`총 수신` 건수가 이론치에 가까운지) 먼저 확인할 것.**
+
+이 자체가 흥미로운 결과다: 부담이 큰 주기에서는 **패킷 유실이 없어도** vsomeip의 TCP 발행이 이 Wi-Fi
+링크에서 목표 주기를 못 따라간다.
+
+### 방법 2 (서버 캡처, 와이어 레벨)
 
 ```
 재전송: SACK 계기 48건, 타이머 계기(RTO/TLP) 0건
@@ -156,3 +210,6 @@ Thor(서버, 유선) → Orin(클라이언트, Wi-Fi), 5ms 주기 SOME/IP 이벤
 - `analyze_recovery.py`는 캡처된 파일 하나만 본다. 서버 쪽 tcpdump가 시작되기 전에 일어난 재전송이나,
   캡처 도중 tcpdump가 패킷을 못 따라간 경우(`tcpdump`가 종료 시 출력하는 "N packets dropped by kernel"
   확인 권장)는 반영되지 않는다.
+- 방법 1(`request-tcp-recovery`)의 `복구 시간`은 순수 네트워크 값이 아니다. vsomeip 자신의 처리 시간과,
+  부담이 큰 주기에서는 서버 쪽 TCP 송신 페이싱(`wait_until_sent`)까지 섞여 들어간다 - 자세한 내용과 실측은
+  위 "결과: 실측값 > 방법 1" 참고. 정밀한 순수 와이어 레벨 값이 필요하면 방법 2를 쓸 것.
