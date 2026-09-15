@@ -114,12 +114,14 @@ SD 측정(`response_sd.sh`/`request_sd.sh`)과 같은 방식으로, 두 보드�
 | TCP 패킷 복구 시간       | 평균 10ms    | 평균 4ms      | 평균 3.46ms(와이어) / 9.7ms(체감) | **평균 0.58ms**(와이어, `--cycle 1`) / 2.7ms(체감) |
 
 3차는 Thor↔Orin을 스위치 대신 이더넷 케이블로 직결하고, 발행 주기를 `--cycle 5`에서 `--cycle 1`로
-바꾼 뒤의 수치 - 와이어 레벨은 이미 목표(2ms)를 여유 있게 통과한다(개별 건 100% ≤2ms). 체감(애플리케이션
-레벨) 값은 여전히 와이어 레벨보다 높은데 - 왜 그런지, 두 지표가 왜 따로 있는지는
-[CHANGES_THOR.md](CHANGES_THOR.md) "Self-stop, self-calibrating baseline, and finding `--cycle 1`"와
-[tcp-recovery/README.md](tcp-recovery/README.md) "결과: 실측값" 참고. 2차(Wi-Fi) 수치는 비교 기준으로
-남겨뒀다. 1차 수치("평균 4ms")는 측정 방법의 결함(`OUTPUT` DROP이 실제로는 선로 유실을 흉내내지 못하는
-문제 등) 때문에 이후 수치와 직접 비교하기는 어렵다.
+바꾼 뒤의 수치 - 와이어 레벨은 이미 목표(2ms)를 여유 있게 통과한다(개별 건 100% ≤2ms, Thor/Orin 어느
+쪽이 client여도 동일). 체감(애플리케이션 레벨) 값은 여전히 와이어 레벨보다 높은데 - 커널 재빌드 없이
+줄일 수 있는지 다시 검토(GRO/IRQ affinity/real-time 스케줄링 다 시도)했지만 효과가 없었고,
+`CONFIG_HZ=250`(4ms 커널 틱)이 가장 유력한 원인으로 남아있다 - 왜 그런지, 두 지표가 왜 따로 있는지는
+[CHANGES_THOR.md](CHANGES_THOR.md) "Live wire-level display, cross-board hardening, and a real
+self-calibration bug"와 [tcp-recovery/README.md](tcp-recovery/README.md) "결과: 실측값" 참고. 2차(Wi-Fi)
+수치는 비교 기준으로 남겨뒀다. 1차 수치("평균 4ms")는 측정 방법의 결함(`OUTPUT` DROP이 실제로는 선로
+유실을 흉내내지 못하는 문제 등) 때문에 이후 수치와 직접 비교하기는 어렵다.
 
 ### config
 
@@ -146,10 +148,14 @@ SD 측정(`response_sd.sh`/`request_sd.sh`)과 같은 방식으로, 두 보드�
 ---
 ## 3. 향후 과제
 
-- (2026-09 갱신) TCP 패킷 복구는 무엇을 바꿔야 하는지 찾았다 - `tcp-recovery/` 참고. 2ms까지 남은 구간은
-  두 가지로 좁혀졌다: 커널 틱(`CONFIG_HZ=250`, `CONFIG_HZ=1000`으로 재빌드 시 이론상 ~1.8ms 추정이지만
-  실물 하드웨어 커널 재빌드라 시도하지 않음)과 Orin이 Wi-Fi라는 점(유선 홉은 0.24ms). 자세한 분해는
+- (2026-09 갱신) TCP 패킷 복구는 무엇을 바꿔야 하는지 찾았다 - `tcp-recovery/` 참고. 와이어 레벨은 이미
+  목표를 통과했고(552-560us, 양방향), 남은 건 체감(애플리케이션) 레벨뿐인데 커널 재빌드 없이 되는
+  방법은 다 시도해봤다(2026-09-15, GRO/IRQ affinity/real-time 스케줄링) - `CONFIG_HZ=250`(재빌드 시
+  이론상 ~1.8ms 추정)이 유일하게 남은, 그러나 손대지 않은 후보다. 자세한 분해는
   [tcp-recovery/README.md](tcp-recovery/README.md) "2ms까지 남은 구간" 참고.
+- (2026-09-15 발견, 미조사) Thor가 client일 때가 Orin이 client일 때보다 체감 복구 시간이 뚜렷하게 더
+  느리고 변동폭도 크다(p90 11ms vs 2.9ms) - 둘 다 동일한 전력/클럭 설정인데도 이렇다. 원인 미파악,
+  [CHANGES_THOR.md](CHANGES_THOR.md) "Next steps" 참고.
 - config를 통한 시간 단축, TCP 프로토콜 내에서 할 수 있는 테스트는 다 해봤기에 SOME/IP 내용 이해 후 SomeIP를 구현한 vSomeIP 코드 내에서  C++ 코드 최적화 과정 진행 필요
 
 

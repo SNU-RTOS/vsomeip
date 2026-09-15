@@ -479,7 +479,133 @@ Three things, found investigating a report that loss went nearly undetected when
 
 **Separately, `response_tcp.sh` now rejects `<client-ip>` equal to its own configured address** — the mistake that produced this whole investigation's original symptom (`inject_loss.sh` silently resolving to `lo` because "the peer" was actually itself), with a clear error instead of silently misrouting.
 
+## Live wire-level display, cross-board hardening, and a real self-calibration bug (2026-09-15)
+
+Four things, in the order worked: make the wire-level `[C]` number visible during
+`response_tcp.sh` itself (not just via a separate offline `run_experiment.sh` pass), test
+Thor and Orin in both client/server roles, re-examine whether anything short of a kernel
+rebuild still gets the application-level number under 2 ms, and dig into why the client's
+and the wire's loss/recovery *counts* disagree.
+
+**1. `response_tcp.sh` now prints `[wire] ...` live**, sourced from a new `--live` mode in
+`analyze_recovery.py`: it reads a line-buffered `tcpdump -l` pipe instead of a finished
+capture file, printing each `[B]`/`[C]` value the instant it's computable and
+self-stopping (same summary format as the offline `--capture` path) after `--min-losses`
+detections — a 4th positional arg on `response_tcp.sh`, default 10, mirroring
+`request_tcp.sh`'s own. Two bugs found getting this to actually terminate cleanly:
+
+- `tcpdump | analyze_recovery.py --live` relied on `tcpdump` getting `SIGPIPE` once the
+  Python side exits, but that only fires on `tcpdump`'s *next write* — with the peer
+  already disconnected, no more matching traffic ever arrives, so it never comes, and
+  `response_tcp.sh` (still waiting on the pipeline) never reaches its own `trap cleanup
+  EXIT`. Switched to a named FIFO: the script gets control back the instant
+  `analyze_recovery.py` exits, for any reason, and kills `tcpdump` explicitly instead of
+  hoping for `SIGPIPE`.
+- `analyze_recovery.py --live` had no way to decide it should stop short of
+  `--min-losses` in the first place — added a 5s idle timeout (`SIGALRM`, reset on every
+  matching packet, only armed after the first one so SD/subscribe startup latency isn't
+  mistaken for idleness). Needed because **the client's own `--min-losses` and the wire's
+  are evaluated against different signals and are not guaranteed to fire on the same
+  event** — see point 4 below. When the client reaches its count first, it unsubscribes
+  and the port goes silent; without this timeout, the still-running wire analyzer (and by
+  extension `response_tcp.sh`, and the loss-injection `iptables` rule, and the server
+  binary it's holding open) would otherwise wait forever for one more retransmission that
+  is never coming.
+
+**2. Cross-board hardening — testing the client on Thor for the first time surfaced an
+environment-drift bug, not a code bug.** Orin's kernel has moved to `5.15.185-tegra`
+since this project's `5.10.104-tegra` baseline (kernels drift under routine system
+updates, independently of this repo), and `xt_u32.ko` does not exist anywhere under that
+kernel's `/lib/modules` at all — not merely unloaded, never built — while `xt_statistic`
+and `xt_tcpudp` still are. `inject_loss.sh` now probes for `xt_u32` with a
+side-effect-free `iptables -C` before building its match rule and falls back to
+source-ip/port + Nth-packet selection (no IP-length/SOME-IP-session-id refinement) with a
+clear warning, instead of hard-failing `start`/`stop` outright. Confirmed both roles now
+work end to end (server=Thor/client=Orin and server=Orin/client=Thor), full teardown
+verified (`iptables -t mangle -S`, `pgrep`) after each run.
+
+**3. Re-examined "is there really no way under 2 ms short of a kernel rebuild" —
+answer unchanged, but with three new negative results instead of zero.** `jetson_clocks`
++ `nvpmodel MAXN` (CPU governor=performance, all C-states disabled, clocks locked) turned
+out to already be applied on both boards, closing off the most likely remaining lever
+before it was even tried. Newly tested and ruled out:
+
+| Tried | Effect |
+|---|---|
+| `ethtool -K eno1 gro off` (Orin) | 2785→2696us — within noise |
+| NIC IRQ affinity moved off CPU0 (Orin) | 2785→2764us — within noise |
+| `chrt -f 80` (whole client process, real-time `SCHED_FIFO`) | **Made measurement worse, not the network**: wire confirmed only 1 real retransmission but the client flagged 20 — the process's own real-time threads were starving each other, not fixing anything |
+
+`CONFIG_HZ=250` (4ms tick, confirmed on both boards via `/boot/config-$(uname -r)`)
+remains the only candidate that's quantitatively consistent with the ~2ms gap (a
+tick-gated wakeup averages half the tick period ≈ 2ms) — and it's the one lever that
+does need a rebuild. No `CONFIG_NO_HZ_FULL`/`nohz_full` workaround applies here either:
+that suppresses the tick on an isolated core running one task, it does not shrink the
+tick period itself, which is what a tick-gated receive-completion wakeup would be
+waiting on.
+
+**4. Why the client's flagged count and the wire's confirmed count disagree — found a
+real bug, fixed it, and the remaining disagreement is structural, not a bug.** Pulled a
+raw pcap in parallel with a live `--live` run and cross-checked: 21 raw retransmission
+segments in the capture, 21 SACK-matched by `analyze_recovery.py` — zero discrepancy, the
+wire side's matching is exact. The client, same run: 50 events flagged out of 185
+received (27%) against the wire's 21 (~16%, the expected rate for 1-in-8 injection).
+Root cause: vsomeip delivers a stall's backlog "in a burst" once the retransmission
+lands (already noted in `request-tcp-recovery.cpp`'s class comment) — the handful of
+messages right after a flagged event arrive with near-zero gaps between them, and those
+were being folded into `recent_gaps_` as if they were steady-state samples. A run of them
+drags the baseline median down (observed: collapsed to single-digit microseconds) until
+every *normal* ~1ms gap afterward looks anomalously large by comparison and gets
+mis-flagged as a new "loss" that never happened. Fixed in `request-tcp-recovery.cpp`:
+also reject candidate baseline samples smaller than `base_us / 4`, not just the large
+ones already excluded by the threshold check. Verified: re-running the same reproduction
+gives a stable ~1060us baseline throughout, no collapse.
+
+Even after the fix, the two counts still don't match exactly — but now for a benign,
+structural reason confirmed by running the same test both ways: whichever side reaches
+its own `--min-losses` target first disconnects and ends the shared TCP session
+immediately, so the *other* side's count reflects only whatever it had confirmed up to
+that moment. This isn't a fixed bias — it flips direction depending on which side happens
+to be faster in a given run:
+
+| Run | client (own log) | wire (server capture) |
+|---|---|---|
+| server=Thor, client=Orin | 60 flagged | 38 confirmed (client raced ahead, ended the session) |
+| server=Orin, client=Thor | 60 flagged | 118 confirmed (wire kept confirming after client had already stopped) |
+
+**Post-fix statistics** (both directions, `--min-losses 60` client-side, generous
+server-side ceiling so it doesn't cut the run short):
+
+| | client (own log) | wire (server, live) |
+|---|---|---|
+| server=Thor, client=Orin (n=60/38) | mean=2753us p50=2707 p90=2871 max=2911 min=2337 | mean=559us p50=557 p90=564 max=592 |
+| server=Orin, client=Thor (n=60/118) | mean=4865us p50=3851 p90=11086 **max=11550** min=2257 | mean=552us p50=560 p90=565 max=575 |
+
+The wire-level number is tight and consistent in both directions (≈552-560us, 100%
+≤2ms, effectively no direction-dependence). The client's own number is not: Thor-as-client
+is both higher on average and far more variable (p90 11ms, max 11.5ms) than Orin-as-client
+(p90 2.9ms) despite both boards carrying the identical `jetson_clocks`/performance-governor
+tuning from point 3 above. That asymmetry itself wasn't root-caused this session — see
+"Next steps" below.
+
 ## Rejected/not applicable
 
 - `iptables` `OUTPUT` `DROP` for loss injection — see "Why the previous method didn't work" above.
 - `tc netem loss` — `sch_netem` is not built into either board's kernel (`modinfo sch_netem` fails on both), and rebuilding a kernel module is out of scope for a test harness.
+- `chrt -f` (real-time `SCHED_FIFO`) on the whole client process — see point 3 above; makes the client's own measurement unreliable via internal thread starvation rather than reducing any real network/OS delay.
+
+## Next steps (not started)
+
+- **Root-cause the Thor-vs-Orin asymmetry** found in point 4's statistics table: Thor as
+  client is both slower on average and much more variable (p90/max) than Orin as client,
+  with identical CPU/power tuning on both. Candidates not yet checked: Thor's NIC driver
+  (`enP2p1s0`, different silicon/driver family than Orin's `nvethernet`/`eno1`) and its
+  own coalescing defaults; core count/topology differences (14 vs 12 cores, different SoC
+  generation) affecting scheduling under the same `CONFIG_HZ=250`.
+- **`bpftrace`/`ftrace` on the receive path** (`napi_gro_receive`, `net_rx_action`, or
+  the TCP receive softirq) to directly confirm-or-refute the `CONFIG_HZ` tick-gating
+  hypothesis from point 3, rather than relying on the correlative half-tick-period
+  argument alone. No kernel rebuild needed for tracing itself.
+- **`CONFIG_HZ=1000` (or a `PREEMPT_RT` kernel)** is the one concrete lever left that
+  numerically lines up with the ~2ms gap — still not attempted, still requires the kernel
+  rebuild this project has stood off from doing on real hardware.
