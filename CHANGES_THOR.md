@@ -657,6 +657,37 @@ here as-is. `tracepoint:tcp:tcp_retransmit_skb` works (fixed-size fields,
 no `sockaddr_in6`) but only fires on the *sender* side, not useful for
 timing the client's receive path.
 
+## Two more non-kernel-rebuild levers tried (2026-09-15) - both null
+
+Closing out the remaining candidates identified above (CPU pinning, `SO_BUSY_POLL`) before
+deciding on the kernel-rebuild question. Both tested on Orin as client against Thor as
+server, `--cycle 1`, same conditions as every other run in this section.
+
+- **Pinning the client's io-threads to the same CPU the NIC's busiest queue (`eno1.vm4`)
+  lands on** (`taskset -pc 0 <tid>`, found via `/proc/interrupts` - it was landing on CPU0
+  by default, matching the earlier observation that nothing here uses `irqbalance`).
+  Idea: even with `jetson_clocks` removing idle-state wake cost, a cross-core wakeup still
+  has some inherent cost (cache-line migration, IPI) that same-core delivery wouldn't.
+  Result: p50 2697us vs baseline's 2707us - a 10us difference, noise. The apparent ~300us
+  *mean* improvement in the raw run was one low outlier (529us, presumably a
+  still-warming-up baseline sample), not a real effect; median is the number to trust here
+  given how skewed individual recovery-time distributions can get.
+- **`net.core.busy_poll=50`** (system-wide low-latency socket polling, applies to
+  epoll-based sockets automatically once a connection's NAPI ID is known - no vsomeip code
+  change needed to test this, unlike per-socket `SO_BUSY_POLL` which would). Result: p50
+  2705us, p90 actually slightly worse (3367 vs ~2900) than without it. No real effect either
+  way. Reverted to the default (0) afterward.
+
+Both are consistent with the bpftrace finding above: if hardirq→NAPI and wakeup→scheduled
+are already both tight, there is no scheduling or cross-core latency left for CPU pinning or
+busy-polling to remove - the time genuinely sits inside the TCP stack's own packet-to-wakeup
+decision, a purely kernel-internal cost neither lever touches.
+
+**This closes out every non-kernel-rebuild lever identified across both of this project's
+TCP-recovery investigation sessions.** What's left (`CONFIG_HZ=1000`, `CONFIG_KPROBES=y`,
+or a `PREEMPT_RT` kernel) all require the kernel rebuild this project has stood off from
+doing on real hardware without explicit sign-off.
+
 ## Next steps (not started)
 
 - ~~**Root-cause the Thor-vs-Orin asymmetry**~~ **Partially explained (2026-09-15, see above)** —
