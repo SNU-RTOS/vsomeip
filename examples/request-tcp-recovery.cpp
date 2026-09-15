@@ -178,7 +178,21 @@ public:
                     condition_.notify_one();
                 // Do not fold this gap into the baseline - it is the very thing we just
                 // decided is NOT normal, and folding it in would drag the baseline upward.
-            } else {
+            } else if (recent_gaps_.size() < kMinBaselineSamples || gap_us >= base_us / 4) {
+                // Reject unusually SMALL gaps too, not just large ones - vsomeip delivers a
+                // stall's backlog "in a burst" once the retransmission lands (see the class
+                // comment), so the handful of messages right after a flagged event arrive
+                // with near-zero gaps between them. Those are not the steady-state publish
+                // interval either; folding them into recent_gaps_ was dragging the median
+                // down (observed live: down to single-digit microseconds after one recovery
+                // burst) until normal ~1ms gaps started looking anomalously large relative to
+                // that collapsed baseline and got mis-flagged as new "losses" that never
+                // happened on the wire - confirmed against tcp-recovery/analyze_recovery.py on
+                // the same capture: 0 discrepancy between raw retransmissions and SACK-matched
+                // ones, so every false positive here was purely this baseline collapsing, not
+                // a real miss on the wire side. Skip this floor during initial calibration
+                // (recent_gaps_ still short) since base_us is only the --cycle seed then and a
+                // real first gap smaller than that seed is not an error.
                 recent_gaps_.push_back(gap_us);
                 if (recent_gaps_.size() > kBaselineWindow)
                     recent_gaps_.pop_front();
