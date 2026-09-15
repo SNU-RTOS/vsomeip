@@ -9,7 +9,11 @@
 #   - 이 스크립트 자신의 "[wire] ..." 줄 - 서버 쪽 tcpdump를 실시간으로 분석한 와이어 레벨 값
 #     (tcp-recovery/analyze_recovery.py --live). 두 지표의 차이와 원리는
 #     tcp-recovery/README.md, tcp-recovery/analyze_recovery.py의 모듈 docstring 참고.
-# 클라이언트와 마찬가지로 유실을 --min-losses건 감지하면 스스로 요약을 찍고 멈춘다.
+#
+# "실제 유실 건수"의 기준은 이 스크립트다 - [wire]가 tcpdump로 잡은 진짜 재전송이 --min-losses건
+# 되면(raw pcap 대조로 정확도 검증됨, CHANGES_THOR.md 참고) 스스로 요약을 찍고 SD 세션을 정상
+# 종료(STOP OFFER)한다. request_tcp.sh(기본 --min-losses 0)는 이걸 감지해서 같이 멈춘다 - 즉
+# 보통은 이 스크립트의 --min-losses만 신경 쓰면 되고, 클라이언트 쪽은 그냥 따라온다.
 #
 # 사용법: sudo ./response_tcp.sh <클라이언트 IP> [주기ms=1] [1/N 유실=8] [최소유실건수=10]
 #   예:   sudo ./response_tcp.sh 10.10.10.2 1 8 10
