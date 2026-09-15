@@ -594,18 +594,88 @@ tuning from point 3 above. That asymmetry itself wasn't root-caused this session
 - `tc netem loss` — `sch_netem` is not built into either board's kernel (`modinfo sch_netem` fails on both), and rebuilding a kernel module is out of scope for a test harness.
 - `chrt -f` (real-time `SCHED_FIFO`) on the whole client process — see point 3 above; makes the client's own measurement unreliable via internal thread starvation rather than reducing any real network/OS delay.
 
+## Chasing the Thor/Orin asymmetry and narrowing the ~2ms gap with bpftrace (2026-09-15)
+
+Follow-up on the two items flagged as "not started" just above.
+
+**1. Thor's NIC is a completely different chip from Orin's, and gives far less
+visibility.** Orin's `eno1` is the Tegra SoC's own integrated `nvethernet` MAC
+(fixed 512us/64-frame coalescing, at least visible via `ethtool -c` even though
+unchangeable). Thor's `enP2p1s0` is a discrete Realtek PCIe card running the
+**`r8126`** driver — `ethtool -c` on it returns `netlink error: Operation not
+supported` (no coalescing info exposed at all, not even read-only), no
+`/sys/module/r8126/parameters/` (no module knobs), and no source available on
+either board to inspect its defaults from. This is a real, structural
+asymmetry between the two boards' NICs, fully consistent with (though not
+proof of) Thor-as-client being both slower and far more variable than
+Orin-as-client in the point 4 statistics above — just not independently
+confirmable without the vendor's driver source or a logic analyzer on the
+PCIe bus, neither in scope here.
+
+**2. Installed `bpftrace` (a normal package, `apt-get install bpftrace` — not
+a kernel change) on both boards to directly trace the receive path instead of
+reasoning from ethtool visibility alone.** Immediately hit a hard limit:
+`CONFIG_KPROBES` and `CONFIG_DYNAMIC_FTRACE` are **not set** in either board's
+kernel config — `bpftrace -l kprobe:...` aborts outright
+(`Could not read symbols from .../available_filter_functions: No such file or
+directory`). This rules out kprobing the exact functions originally proposed
+(`napi_gro_receive`, `net_rx_action`, `tcp_rcv_established`) — that would
+require a kernel rebuild with those options on, which is exactly the
+constraint this investigation is operating under. Only *static* tracepoints
+(compiled into the kernel regardless of `CONFIG_DYNAMIC_FTRACE`) are usable.
+
+Worked around it with three tracepoint-only measurements on Orin (client),
+during a live loss-injection run, using `tracepoint:irq:irq_handler_entry`,
+`tracepoint:napi:napi_poll`, and `tracepoint:sched:sched_wakeup`/`sched_switch`
+filtered to the client's own io-thread TIDs (read live from vsomeip's own
+startup log):
+
+| Stage measured | Result |
+|---|---|
+| NIC hardirq → NAPI poll runs | 8-32us (tight) |
+| io-thread `sched_wakeup` → actually on-CPU (`sched_switch`) | **2-4us** (tight) |
+| vsomeip's own `receive_cbk`→`on_message`→callback (measured previously, see the earlier instrumentation writeup) | ~24us (tight) |
+
+All three stages that *can* be instrumented without kprobes are fast and
+account for well under 100us combined — leaving essentially the entire
+~2.2ms application-vs-wire gap inside the one stage that's now provably the
+remaining suspect: **NAPI finishes extracting the packet → the TCP stack
+processes it and decides to call `sk_data_ready()`/wake the socket.** This
+is exactly the function-level detail (`tcp_rcv_established` et al.) that
+`CONFIG_KPROBES=n` blocks from being traced directly. The `CONFIG_HZ=250`
+tick-gating hypothesis from the earlier section is now narrowed to this one
+specific stage rather than "somewhere in the receive path" generally, but
+confirming the *mechanism* inside it still needs either kprobes (kernel
+rebuild) or a differently-instrumented kernel module (also effectively a
+rebuild for this purpose).
+
+Attempted `tracepoint:tcp:tcp_probe` first (would have given exact per-flow,
+port-filtered receive timestamps) — its bpftrace type definition references
+`struct sockaddr_in6` which this kernel's BTF can't resolve
+(`invalid application of 'sizeof' to an incomplete type`), so it's unusable
+here as-is. `tracepoint:tcp:tcp_retransmit_skb` works (fixed-size fields,
+no `sockaddr_in6`) but only fires on the *sender* side, not useful for
+timing the client's receive path.
+
 ## Next steps (not started)
 
-- **Root-cause the Thor-vs-Orin asymmetry** found in point 4's statistics table: Thor as
-  client is both slower on average and much more variable (p90/max) than Orin as client,
-  with identical CPU/power tuning on both. Candidates not yet checked: Thor's NIC driver
-  (`enP2p1s0`, different silicon/driver family than Orin's `nvethernet`/`eno1`) and its
-  own coalescing defaults; core count/topology differences (14 vs 12 cores, different SoC
-  generation) affecting scheduling under the same `CONFIG_HZ=250`.
-- **`bpftrace`/`ftrace` on the receive path** (`napi_gro_receive`, `net_rx_action`, or
-  the TCP receive softirq) to directly confirm-or-refute the `CONFIG_HZ` tick-gating
-  hypothesis from point 3, rather than relying on the correlative half-tick-period
-  argument alone. No kernel rebuild needed for tracing itself.
+- ~~**Root-cause the Thor-vs-Orin asymmetry**~~ **Partially explained (2026-09-15, see above)** —
+  Thor's NIC is a different chip/driver (`r8126`, discrete Realtek PCIe) than Orin's
+  (`nvethernet`, Tegra-integrated), with no `ethtool -c` visibility or module params at
+  all on Thor's side, unlike Orin's readable-if-not-writable 512us. Plausible but not
+  independently provable without the vendor driver's source. Core-count/topology was not
+  checked further — deprioritized once the NIC-driver difference turned up, since it's a
+  cleaner, sufficient-looking explanation on its own.
+- ~~**`bpftrace`/`ftrace` on the receive path**~~ **Attempted (2026-09-15, see above),
+  hit a hard limit**: `CONFIG_KPROBES`/`CONFIG_DYNAMIC_FTRACE` are not set on either
+  board, so `napi_gro_receive`/`net_rx_action`/`tcp_rcv_established` can't be kprobed
+  without a kernel rebuild. Tracepoint-only measurements (hardirq→NAPI, wakeup→scheduled)
+  came back tight (tens of µs) on every stage that *can* be measured this way, narrowing
+  the ~2.2ms gap down to specifically "NAPI hands the packet to the TCP stack → the stack
+  decides to wake the socket" - but confirming what happens **inside** that stage still
+  needs kprobes.
 - **`CONFIG_HZ=1000` (or a `PREEMPT_RT` kernel)** is the one concrete lever left that
   numerically lines up with the ~2ms gap — still not attempted, still requires the kernel
-  rebuild this project has stood off from doing on real hardware.
+  rebuild this project has stood off from doing on real hardware. Enabling
+  `CONFIG_KPROBES`/`CONFIG_DYNAMIC_FTRACE` in the same rebuild would also unblock a
+  direct confirmation of the mechanism, not just its rough location.
