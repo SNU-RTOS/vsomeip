@@ -178,3 +178,5 @@
 
 # tcp-recovery experiment outputs (see tcp-recovery/run_experiment.sh)
 /tcp-recovery/results/
+raw-udp-recovery/sender
+raw-udp-recovery/receiver

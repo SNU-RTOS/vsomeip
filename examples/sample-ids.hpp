@@ -20,4 +20,11 @@
 #define OTHER_SAMPLE_INSTANCE_ID 0x5422
 #define OTHER_SAMPLE_METHOD_ID  0x1421
 
+// Second instance of SAMPLE_SERVICE_ID, offered alongside the first by
+// response-udp-recovery.cpp: a dedicated UDP port for the recovery
+// request/response RPC (SAMPLE_METHOD_ID), kept separate from the lossy
+// event stream's own port so loss injection (which targets one UDP port)
+// never also drops the recovery exchange it is supposed to be measuring.
+#define RECOVERY_RPC_INSTANCE_ID 0x5679
+
 #endif // VSOMEIP_EXAMPLES_SAMPLE_IDS_HPP

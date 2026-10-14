@@ -710,3 +710,62 @@ doing on real hardware without explicit sign-off.
   rebuild this project has stood off from doing on real hardware. Enabling
   `CONFIG_KPROBES`/`CONFIG_DYNAMIC_FTRACE` in the same rebuild would also unblock a
   direct confirmation of the mechanism, not just its rough location.
+
+## A "fast recovery" prototype - and a wrong turn worth keeping on record (2026-10-14)
+
+With kernel rebuild still off the table, tried building a custom application-level
+recovery path instead of relying on TCP's kernel-level retransmission, on the theory
+(from the bpftrace section above) that the stuck ~2ms-plus cost might be *TCP-stack*
+processing specifically (ACK scheduling, congestion state, reorder-queue management -
+none of which a UDP socket does), not a generic kernel-receive-path cost. Two attempts,
+on the Thor↔Thor direct link from the section above:
+
+**Attempt 1 - `examples/{request,response}-udp-recovery.cpp`.** A second vsomeip
+service/event pair over UDP, with a deterministic loss signal (a plain sequence-number
+gap - no heuristic, no self-calibrating baseline, no false positives possible, unlike
+`request-tcp-recovery.cpp`'s long history of baseline bugs) that fires an RPC request at
+a second service instance (`RECOVERY_RPC_INSTANCE_ID`, its own UDP port, never touched by
+loss injection) and times the round trip. **Result: ~13.9ms - worse than TCP, not
+better.** A `tcpdump` capture on the RPC's own port pinned the delay: request arrives at
+the server and the response leaves it **8-9ms apart on the wire itself** - i.e. inside
+the server process, between vsomeip handing the request to our handler and our handler's
+`send()` actually leaving the socket. Most likely culprit (not confirmed further):
+vsomeip's dispatch thread, busy with the continuous 1ms event-publish loop's own internal
+bookkeeping, serializing the RPC handler behind it. Useful as a negative result in its
+own right - it does not tell us anything about the original TCP-stack-vs-generic-kernel
+question, because it introduces a *different* bottleneck (vsomeip's own dispatch
+architecture) that doesn't exist in the TCP-recovery comparison at all. (`max_dispatchers`
+defaults to 10 per vsomeip's own config code, so "only one dispatch thread" isn't the
+whole story - not chased further; worth a follow-up look before writing off vsomeip's own
+RPC path entirely.)
+
+**Attempt 2 - `raw-udp-recovery/{sender,receiver}.cpp`.** Same experiment, vsomeip removed
+entirely - plain POSIX UDP sockets, no SOME/IP framing, no dispatch queue: one blocking
+`sendto`/`recvfrom` loop on each end. Same deterministic gap detection, same
+`tcp-recovery/inject_loss.sh` mechanism (extended with a `PROTO=udp` mode - UDP's fixed
+8-byte header has no TCP-style variable-length complication, so no u32 expression is
+needed; the dedicated recovery port makes the existing IP-length/session-id refinement
+needed for TCP's shared port unnecessary here too). **Result: mean 250-584us, p90
+365-749us, max 725-1038us, both directions, n=10 and n=50 runs - solidly under 2ms, in
+the same range as TCP's own *wire-level* number (140-560us on this link).**
+
+This is the clean answer attempt 1 couldn't give: once vsomeip's own dispatch machinery
+is out of the picture, a minimal "notice a gap, ask for fresh data, time the round trip"
+mechanism already clears 2ms on this hardware **without any kernel change** - the
+~2.6-2.7ms application-level TCP number was never a hard floor set by this host's kernel;
+it is specific to going through vsomeip's full stack for this message pattern. Practical
+implication: a production version of this would need to either (a) keep the recovery
+side-channel outside vsomeip/SOME-IP (what was just tested, at the cost of giving up
+SOME/IP framing, security policy, and routing for that one channel), or (b) find and fix
+whatever in vsomeip's own request/response or dispatch path attempt 1 ran into - the
+`max_dispatchers` question above is the natural next thing to check before settling on
+(a). Either way, not something this session chased to a final design - this was scoped as
+"does the premise hold at all", and it does.
+
+Build: `raw-udp-recovery/` has its own `Makefile` (not wired into the vsomeip CMake - it
+has no vsomeip dependency at all, deliberately). `make` in that directory on each board,
+then `./sender <peer-ip> [cycle_ms] [event_port] [recovery_port]` on the sender side and
+`./receiver <peer-ip> [min_losses] [event_port] [recovery_port]` on the receiver side -
+ports default to 30513/30514. Loss injection: `sudo PROTO=udp PORT=30513 EVERY=8
+tcp-recovery/inject_loss.sh start <sender-ip> <receiver-ip>` on the sender's host (same
+`stop` to tear down).

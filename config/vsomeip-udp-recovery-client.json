@@ -1,0 +1,32 @@
+{
+    "unicast" : "10.10.10.1",
+    "logging" :
+    {
+        "level" : "debug",
+        "console" : "true",
+        "file" : { "enable" : "false", "path" : "/tmp/vsomeip.log" },
+        "dlt" : "false"
+    },
+    "applications" :
+    [
+        {
+            "name" : "client-sample",
+            "id" : "0x1343"
+        }
+    ],
+    "routing" : "client-sample",
+    "service-discovery" :
+    {
+        "enable" : "true",
+        "multicast" : "224.244.224.245",
+        "port" : "30490",
+        "protocol" : "udp",
+        "initial_delay_min" : "0",
+        "initial_delay_max" : "0",
+        "repetitions_base_delay" : "1",
+        "repetitions_max" : "1",
+        "ttl" : "3",
+        "cyclic_offer_delay" : "20000000",
+        "request_response_delay" : "0"
+    }
+}

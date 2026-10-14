@@ -34,7 +34,8 @@ Usage:
 
 Options (env vars, same defaults for start/stop - pass the same ones to both):
   IFACE=<name>        egress interface (default: interface of the default route)
-  PORT=<n>             reliable SOME/IP TCP port to target        (default: 30510)
+  PORT=<n>             SOME/IP port to target                     (default: 30510)
+  PROTO=tcp|udp        transport to match                          (default: tcp)
   EVERY=<n>            drop 1 in every N first-transmissions       (default: 8)
   IPLEN=<min>:<max>    only match segments whose IP total length falls in this
                        range, i.e. the payload size band to target (default: 69:1500,
@@ -68,6 +69,7 @@ CMD=$1; SRV_IP=$2; CLI_IP=$3
 IFACE=${IFACE:-$(ip route get "$CLI_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')}
 IFACE=${IFACE:-$(ip route show default | awk '/default/{print $5; exit}')}
 PORT=${PORT:-30510}
+PROTO=${PROTO:-tcp}
 EVERY=${EVERY:-8}
 IPLEN=${IPLEN:-69:1500}
 MARK=${MARK:-0x5a}
@@ -92,14 +94,26 @@ CHAIN=SOMEIP_LOSS
 # missing, or the ordinary "does not exist" if it's just that this exact rule isn't
 # present, which tells us the module loaded fine. Fall back to source ip/port + Nth-packet
 # only (no length/session-id refinement) when it's unavailable, rather than hard-failing.
-U32="0&0xFFFF=${IPLEN}&&0>>22&0x3C@12>>26&0x3C@8&0x7=0"
-if iptables -t mangle -C OUTPUT -p tcp --sport 0 -m u32 --u32 "$U32" -j ACCEPT 2>&1 \
-        | grep -q "Couldn't load match"; then
-    echo "경고: 이 커널($(uname -r))엔 xt_u32가 없음 - IP 길이/SOME-IP 세션id 기반 선별 없이" \
-         "출발지 IP:포트 + Nth패킷만으로 유실을 주입함 (드물게 제어 패킷이 걸릴 수 있음)" >&2
-    MATCH=(-p tcp -s "$SRV_IP" --sport "$PORT" -m statistic --mode nth --every "$EVERY" --packet 0)
+# UDP has no variable-length header the way TCP does (always exactly 8 bytes), so there
+# is no equivalent "TCP header length" offset for the u32 expression above to compute -
+# it is TCP-specific by construction. UDP loss injection also doesn't need the
+# session-id refinement in the first place: this project only ever points it at a
+# dedicated UDP port carrying nothing but one message type (see
+# examples/response-udp-recovery.cpp's two-port design), so a plain source-ip/port +
+# Nth-packet match can't accidentally catch an unrelated control packet the way it
+# could on a shared TCP connection. Skip the u32 probe/match entirely for UDP.
+if [ "$PROTO" = udp ]; then
+    MATCH=(-p udp -s "$SRV_IP" --sport "$PORT" -m statistic --mode nth --every "$EVERY" --packet 0)
 else
-    MATCH=(-p tcp -s "$SRV_IP" --sport "$PORT" -m u32 --u32 "$U32" -m statistic --mode nth --every "$EVERY" --packet 0)
+    U32="0&0xFFFF=${IPLEN}&&0>>22&0x3C@12>>26&0x3C@8&0x7=0"
+    if iptables -t mangle -C OUTPUT -p tcp --sport 0 -m u32 --u32 "$U32" -j ACCEPT 2>&1 \
+            | grep -q "Couldn't load match"; then
+        echo "경고: 이 커널($(uname -r))엔 xt_u32가 없음 - IP 길이/SOME-IP 세션id 기반 선별 없이" \
+             "출발지 IP:포트 + Nth패킷만으로 유실을 주입함 (드물게 제어 패킷이 걸릴 수 있음)" >&2
+        MATCH=(-p tcp -s "$SRV_IP" --sport "$PORT" -m statistic --mode nth --every "$EVERY" --packet 0)
+    else
+        MATCH=(-p tcp -s "$SRV_IP" --sport "$PORT" -m u32 --u32 "$U32" -m statistic --mode nth --every "$EVERY" --packet 0)
+    fi
 fi
 
 case "$CMD" in
