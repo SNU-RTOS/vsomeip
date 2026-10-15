@@ -959,3 +959,48 @@ of the same service/instance (reliable, different port) from the preceding test 
 session: vsomeip's SD layer logged "Remote offer type changed" and flapped availability,
 and zero requests were ever actually sent. A fresh instance id sidesteps the whole class of
 bug instead of relying on tests never overlapping within a session's SD/routing state.
+
+## Making the RPC-retry test's own logs legible - send/receive/response lines, and how to verify a loss actually happened (2026-10-15)
+
+`request-rpc-retry.cpp`/`response-rpc-retry.cpp` (the winning design from the section
+above) had a gap: the client only ever printed something when a *retry* fired
+(`[timeout]`/`[recovered]`) - the original, non-retried send was silent, and the server
+printed nothing at all on either receiving a request or sending a response. Fine for
+measuring aggregate numbers, confusing for eyeballing what actually happened to one
+specific request across two boards' logs.
+
+Added:
+- `request-rpc-retry.cpp`'s `send_locked()`: `[send] 요청 #N (재전송)? session=0x..` on
+  every send, initial or retry.
+- `response-rpc-retry.cpp`'s `on_request()`: `[request] 요청 수신 session=0x.. client=0x..`
+  on receipt, `[response] 응답 송신 session=0x.. client=0x..` right after `app_->send()`.
+
+The session id is what makes these actually line up across the two boards' logs, not just
+decoration: `application_impl::send()` (`implementation/runtime/src/application_impl.cpp:872`)
+assigns the real wire session id into the request message *in place*, synchronously, before
+`send()` returns - so reading `request_->get_session()` right after `app_->send(request_)`
+gives exactly the id the server will see on `_request->get_session()`. `create_response()`
+copies that same session (and client id) onto the response, and a response's send doesn't
+reassign it - so client `[send] session=0x7` / server `[request] session=0x7` / server
+`[response] session=0x7` are always the same request, start to finish. Verified locally
+(shared-routing-manager same-host run, no loss injection): 19/19 sends matched 1:1 with
+19/19 server request+response pairs, strictly increasing session ids, zero surprises.
+
+Separately, the client-only app logs can't answer "did a packet actually get dropped" -
+`inject_loss.sh` diverts the server's outgoing response at the kernel level (iptables
+mangle + policy route), *after* `app_->send()` has already returned successfully, so
+`[response] 응답 송신` prints identically whether that specific packet made it onto the wire
+or not. Documented two ways to check for real, in `RPC_RETRY_REPORT.md`'s new "실제 유실
+확인하기" section:
+- `sudo dmesg | grep -c SOMEIP_DROP` - `inject_loss.sh` already tags every actual kernel-level
+  drop with this prefix (`tcp-recovery/inject_loss.sh:127`), so this is a precise count of
+  real losses, no ambiguity. Compare against the client's `[timeout]`/`[recovered]` counts to
+  sanity-check the injection rate and catch a too-short timeout causing false positives.
+  Already available in the codebase before this change - just hadn't been surfaced as "the"
+  answer to "how do I confirm a loss really happened" until now.
+  - `tcpdump`/Wireshark on the real NIC as a visual fallback - acceptable per the user
+  ("로그로 불가능하면 wireshark 같은 툴로 봐도 될 것 같아"), but weaker: capturing on the
+  server's physical interface won't by itself distinguish a diverted response from a normal
+  one (the diversion happens before the packet reaches that NIC either way); the clear
+  tell is on the client side - a session whose request went out more than once with only
+  one matching response.

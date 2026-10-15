@@ -84,9 +84,16 @@ public:
     // each request is independent (no shared state to resend "the same" answer from), so a
     // retry is just another request as far as this handler is concerned.
     void on_request(const std::shared_ptr<vsomeip::message> &_request) {
+        std::cout << "[request] 요청 수신 session=0x" << std::hex << _request->get_session()
+                  << " client=0x" << _request->get_client() << std::dec << std::endl;
         std::shared_ptr<vsomeip::message> its_response =
                 vsomeip::runtime::get()->create_response(_request);
         app_->send(its_response);
+        // create_response() copies session/client from _request, and send() does not
+        // reassign them for a response - so this is the same session id request-rpc-retry.cpp
+        // printed in its own [send] line, usable to match the two sides' logs up by eye.
+        std::cout << "[response] 응답 송신 session=0x" << std::hex << its_response->get_session()
+                  << " client=0x" << its_response->get_client() << std::dec << std::endl;
     }
 
     void run() {

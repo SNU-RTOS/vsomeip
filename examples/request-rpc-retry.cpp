@@ -142,6 +142,13 @@ public:
         last_sent_at_ = std::chrono::high_resolution_clock::now();
         ++sent_;
         app_->send(request_);
+        // application_impl::send() assigns the real wire session id to request_ in place
+        // (for requests only) before this call returns, so logging it *after* send() gives
+        // the same id the server will see on _request->get_session() - use it to match this
+        // line up against the server's [request]/[response] lines in its own log.
+        std::cout << "[send] 요청 #" << sent_ << (_is_retry ? " (재전송)" : "")
+                  << " session=0x" << std::hex << request_->get_session() << std::dec
+                  << std::endl;
     }
 
     // Polls for "it has been too long since the last send and still nothing back" -
