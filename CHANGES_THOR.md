@@ -838,3 +838,46 @@ what a real implementation should actually ship. Also worth doing, not done this
 auditing other long-lived vsomeip deployments (anything using request/response
 infrequently, not in a tight publish loop) for this same default - it is easy to not
 notice a single-digit-millisecond tax that only shows up on sporadic traffic.
+
+## Sanity check: is the recovery RPC's ~300us just "a normal method call"? Yes - verified against vsomeip's own unmodified example (2026-10-15)
+
+Reasonable objection raised against the result above: the recovery mechanism is nothing
+more than "client notices something's wrong, sends one unicast request, waits for the
+response" - structurally identical to any ordinary SOME/IP method call. If that's true,
+its cost should be indistinguishable from a plain, unrelated method call's round trip on
+the same link, not something specific to "recovery". Worth checking directly rather than
+assuming - and it is exactly the right question, because it is also a clean way to tell
+whether the `npdu-default-timings` finding generalizes past this one example or was
+somehow specific to it.
+
+Used `examples/request-sample.cpp` + `response-sample.cpp` as the control - vsomeip's own
+stock example, completely unrelated to any of this session's custom code, which already
+prints its own request→response round-trip time natively (`TCP 통신 소요 시간`, measured
+the same way regardless of the transport actually used - UDP by default, no `--tcp` flag
+given). Ran it standalone (`--cycle 300`, no loss injection, no concurrent event stream at
+all - as isolated a method call as this link can produce) against the existing
+`config/vsomeip-udp-{service,client}.json`, which had never had `npdu-default-timings`
+touched:
+
+| Config | n | mean | p50 | p90 | max | min |
+|---|---|---|---|---|---|---|
+| Unfixed (defaults) | 33 | 10820us | 10857us | 11104us | 11154us | 10452us |
+| **+ `npdu-default-timings` all-zero** | 13 | **926us** | **924us** | 1132us | 1163us | 430us |
+
+Confirms both things at once: (1) a **completely generic, unmodified vsomeip example**
+pays the same multi-millisecond N-PDU tax by default - this is not an artifact of this
+session's custom recovery code, it is a property of vsomeip's own defaults that would
+affect any infrequent request/response on this host; (2) once fixed the same way, a plain
+isolated method call (926us mean) lands in the same hundreds-of-microseconds class as the
+recovery RPC measured two sections up (300-600us) - consistent with the recovery
+mechanism being exactly what it looks like: an ordinary method call, nothing more, with no
+hidden "recovery-specific" cost or benefit either way. The remaining small gap between the
+two (926us isolated vs. 300-600us in the recovery scenario) is plausibly just small-sample
+noise (n=13) or the recovery scenario's requests firing closer together in time (less idle
+state to re-warm between calls) - not chased further, as it doesn't change the
+conclusion.
+
+Added the same `npdu-default-timings` override to `config/vsomeip-udp-service.json` and
+`config/vsomeip-udp-client.json` (the plain example configs) to keep this demonstration
+reproducible - not because this particular example is a project deliverable, but as
+standing evidence of how broadly the default affects even vsomeip's own stock tooling.

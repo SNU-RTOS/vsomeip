@@ -70,6 +70,13 @@
             }
         }
     ],
+    "npdu-default-timings" :
+    {
+        "debounce-time-request" : "0",
+        "debounce-time-response" : "0",
+        "max-retention-time-request" : "0",
+        "max-retention-time-response" : "0"
+    },
     "routing" : "service-sample",
     "service-discovery" :
     {

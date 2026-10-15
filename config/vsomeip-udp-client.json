@@ -35,6 +35,13 @@
             "unreliable" : [ 40000, 40002 ]
         }
     ],
+    "npdu-default-timings" :
+    {
+        "debounce-time-request" : "0",
+        "debounce-time-response" : "0",
+        "max-retention-time-request" : "0",
+        "max-retention-time-response" : "0"
+    },
     "routing" : "client-sample",
     "service-discovery" :
     {
