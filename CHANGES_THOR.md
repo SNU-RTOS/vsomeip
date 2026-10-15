@@ -769,3 +769,72 @@ then `./sender <peer-ip> [cycle_ms] [event_port] [recovery_port]` on the sender 
 ports default to 30513/30514. Loss injection: `sudo PROTO=udp PORT=30513 EVERY=8
 tcp-recovery/inject_loss.sh start <sender-ip> <receiver-ip>` on the sender's host (same
 `stop` to tear down).
+
+## Found it: attempt 1's ~13.9ms was `npdu-default-timings`, not dispatch - and it's fixable (2026-10-15)
+
+Followed up on the `max_dispatchers` question above with the same instrumentation style
+used throughout this document - temporary `VSOMEIP_ERROR` timestamp prints (not kprobes;
+this is all in vsomeip's own application code, fully traceable without kernel support) at
+four points: `udp_server_endpoint_impl::on_message_received` (wire arrival),
+`application_impl::on_message` (pushed onto the dispatch queue), `invoke_handler` (about
+to call our handler), and our own handler's own completion. Rebuilt `libvsomeip3.so` with
+these, reverted before committing (grep confirms none remain).
+
+**Server-side chain is fast - wrong turn in the "dispatch contention" theory.** All five
+measured round trips: wire-arrival → `on_message` → `invoke_handler` → handler-done
+inside **73-265us total**. So "our RPC handler is stuck in a busy dispatch queue" was
+wrong. But the *client's own* send→recv timestamps, added the same way, still showed
+~13ms per round trip, and a parallel `tcpdump` on the RPC port confirmed it: ~8ms sits
+between the request's wire-arrival and the response's wire-departure *on the server's own
+interface* - contradicting the fast in-process numbers, until lining the two up revealed
+why: `application_impl::on_recovery_request` (really: `send_intern` in
+`server_endpoint_impl.cpp`) doesn't hand new outbound messages straight to the socket. It
+queues them into a "train" (`its_data.train_`) that only departs after a **debounce time**
+or at latest a **maximum retention time** - vsomeip's own small-message-aggregation
+feature (N-PDU aggregation), present on both TCP and UDP server endpoints. When
+unconfigured per-service, it falls back to a *global default*:
+`VSOMEIP_DEFAULT_NPDU_DEBOUNCING_NANO` = **2ms**, `VSOMEIP_DEFAULT_NPDU_MAXIMUM_RETENTION_NANO`
+= **5ms** (`implementation/configuration/include/internal.hpp`). Neither config in this
+project had ever set it explicitly. A continuous same-event stream (like the TCP/UDP
+event-recovery tools' 1ms publish loop) mostly dodges this - a new message of the *same*
+service+method already has a "passenger" in the train and forces immediate departure -
+but a sporadic, one-off message like our recovery RPC response (and request) has no such
+sibling, and pays close to the full debounce+retention cost on *each side* it passes
+through.
+
+**Fix: a global override, no code change.**
+
+```json
+"npdu-default-timings": {
+    "debounce-time-request": "0", "debounce-time-response": "0",
+    "max-retention-time-request": "0", "max-retention-time-response": "0"
+}
+```
+
+(top-level key, milliseconds, same level as `"services"`/`"routing"`.) Applied to only
+one side first (`config/vsomeip-udp-recovery-service.json`) to see the shape of the
+effect: ~13.9ms → ~5.3ms - exactly consistent with having removed one side's ~7-8ms while
+the *client's own* outbound request was still paying it on the other. Applied to both
+(`config/vsomeip-udp-recovery-client.json` too): **~13.9ms → 307us (236-514us range) -
+matching `raw-udp-recovery`'s own 250-584us almost exactly.**
+
+**Checked whether this also explains the original TCP recovery gap - it does not.**
+Added the same override to `config/vsomeip-tcp-{service,client}.json` and re-ran the
+existing TCP recovery test: application-level mean **2671us**, p50 2663us - indistinguishable
+from every prior measurement in this document (2653-2720us). Reverted that change (no
+measured benefit, kept the diff minimal). This makes sense in hindsight: N-PDU debounce is
+an *outbound send-side* throttle, and the TCP recovery gap was already localized (via
+bpftrace, above) to the *receive* side on an already-fast wire - the two are genuinely
+different bottlenecks that happened to produce superficially similar-looking multi-ms
+numbers.
+
+**What this actually settles: the "fast recovery" question from two sections up has a
+cleaner answer than "bypass vsomeip with raw sockets."** `examples/{request,response}-udp-recovery.cpp`
+with this one config addition reaches the same ~300us recovery time as the raw-socket
+version, *while keeping full SOME/IP framing, routing, and (where configured) security
+policy* - no need to give any of that up. The raw-socket version stays in the repo as the
+control that proved the kernel/network weren't the bottleneck here; this config fix is
+what a real implementation should actually ship. Also worth doing, not done this session:
+auditing other long-lived vsomeip deployments (anything using request/response
+infrequently, not in a tight publish loop) for this same default - it is easy to not
+notice a single-digit-millisecond tax that only shows up on sporadic traffic.
