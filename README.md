@@ -1,175 +1,327 @@
 # vSomeIP 프로토콜 최적화 프로젝트
 
-본 README는 **vSomeIP** 프로토콜의 **Service Discovery (SD) 시간** 및 **TCP 패킷 복구 시간** 최적화를 목표로 진행한 프로젝트의 세부 내용을 담고 있음
+본 README는 **vSomeIP** 프로토콜의 **Service Discovery(SD) 지연 시간** 및
+**패킷 복구 시간** 최적화를 목표로 진행한 프로젝트의 최종 결과를 담고 있다.
+
+> 세부 과정(날짜별 시행착오, 기각된 시도까지 포함한 전체 기록)은 [CHANGES_THOR.md](CHANGES_THOR.md),
+> 항목별 상세 비교는 [SD_LATENCY_REPORT.md](SD_LATENCY_REPORT.md) /
+> [TCP_RECOVERY_REPORT.md](TCP_RECOVERY_REPORT.md) / [RPC_RETRY_REPORT.md](RPC_RETRY_REPORT.md)에
+> 있다. 이 README는 그 내용을 "결론 + 재현 방법" 수준으로 압축한 요약이다.
+
+---
+
+## 목차
+
+1. [개요](#1-개요)
+2. [Service Discovery(SD) 지연 시간](#2-service-discoverysd-지연-시간)
+3. [패킷 복구 시간](#3-패킷-복구-시간)
+4. [공통 개발 환경](#4-공통-개발-환경)
+5. [향후 과제](#5-향후-과제)
+6. [참고 자료](#6-참고-자료)
 
 ---
 
 ## 1. 개요
 
-### 프로젝트 배경
+[vSomeIP](https://github.com/covesa/vsomeip)는 자동차 통신 시스템에서 널리 쓰이는
+SOME/IP 미들웨어 구현체로, ECU 간의 통신을 지원한다. 본 프로젝트는 커널 재빌드 없이
+(스택 교체 금지, 애플리케이션/설정/라이브러리 코드 레벨에서만 해결) 아래 두 지표를
+2ms 이하로 낮추는 것을 목표로 진행했다.
+([vSomeIP 개괄](https://github.com/COVESA/vsomeip/wiki/vsomeip-in-10-minutes))
 
-[vSomeIP](https://github.com/covesa/vsomeip)는 자동차 통신 시스템에서 널리 사용되는 미들웨어 솔루션으로, ECU 간의 통신을 지원  
-본 프로젝트는 **SD 시간**과 **TCP 패킷 복구 시간**의 최적화를 목표
+| 목표 | 2024-2 | 2026-2 |
+|---|---|---|
+| **SD 지연 시간** | 4ms (검증 통과) | **2ms → 평균 1.19ms로 달성** |
+| **패킷 복구 시간** | 4ms (검증 통과) | **2ms → (아래 "최종 결론" 참고) 설계 전환으로 달성** |
 
-[vSomeIP에 대한 개괄적인 내용](https://github.com/COVESA/vsomeip/wiki/vsomeip-in-10-minutes)
-
-### 프로젝트 목표
-
-1. **SD 지연 시간** 단축
-
-- [x] 2024-2: 4s (검증 통과)
-- [ ] 2026-2: 2s
-
-2. **TCP 패킷 복구 시간** 단축
-
-- [x] 2024-2: 4s (검증 통과)
-- [ ] 2026-2: 2s
-
+패킷 복구 시간은 한 가지 숫자로 끝나지 않는다 — TCP 자체의 재전송 메커니즘만으로는
+커널 재빌드 없이 2ms 벽을 넘지 못했고, 대신 **"무엇으로 복구하느냐"가 아니라
+"유실을 얼마나 빨리, 애매함 없이 확정할 수 있느냐"가 진짜 병목**이라는 것을 확인한
+뒤, 그 병목이 원천적으로 없는 설계(요청/응답 + timeout + 재전송)로 전환해 목표를
+달성했다. 자세한 내용은 [3절](#3-패킷-복구-시간)에 있다.
 
 ---
 
-## 2. 실험
+## 2. Service Discovery(SD) 지연 시간
 
-### 개발 환경
+### 2.1 정의
+
+클라이언트가 아직 서버의 존재를 모르는 상태에서, SOME/IP-SD(`FindService`/
+`OfferService`, UDP 멀티캐스트 `224.244.224.245:30490`)를 통해 서버를 찾아내
+실제로 통신 가능한 상태가 되기까지 걸리는 시간.
+
+### 2.2 측정 구간
+
+```
+request_service() 호출 가능 시점                서비스를 실제로 찾아낸 시점
+   (ST_REGISTERED 콜백)        ─────────────▶      (on_availability 콜백)
+         │                                               │
+         └── FindService 송신 → OfferService 수신·매칭 확인까지의 전체 과정 ──┘
+```
+
+`examples/request-sd.cpp`에서 **`ST_REGISTERED`(클라이언트 상태 콜백) →
+`on_availability`(서비스 `0x1234.0x5678` 발견 콜백)** 까지의 시간을 측정 단위로
+삼았다. 이 구간이 사용자 애플리케이션이 실제로 체감하는 "서비스를 쓸 수 있게 되기까지"와
+일치한다.
+
+### 2.3 Baseline
+
+| | 값 |
+|---|---|
+| **Baseline (최적화 전, Orin, Wi-Fi/스위치)** | **평균 20ms** |
+
+### 2.4 무엇을 바꿨고, 얼마나 기여했는가
+
+| # | 변경 | 설명 | 기여(실측) |
+|---|---|---|---|
+| 1 | `initial_delay_min/max` = `0` (서버·클라이언트 공통) | SD 스펙상 트래픽 폭주 방지용 무작위 시작 대기를 제거 | 시작 전 대기 1~5ms 제거 |
+| 2 | SD 응답을 항상 unicast로 강제 | `OfferService` 응답을 멀티캐스트 대신 유니캐스트로만 전송(2대 점대점 환경 한정 최적) | 멀티캐스트 join/처리 오버헤드 제거 |
+| 3 | `VSOMEIP_SD_FAST_START` 추가 | netlink(인터페이스/라우트) 이벤트를 기다리지 않고 SD를 즉시 시작 | 같은 호스트 1349→1116us, Wi-Fi 2724→2488us(중앙값) |
+| 4 | CPU governor=performance, idle state 비활성화, Wi-Fi 절전모드 끔 | 전력 절약 상태로 인한 응답 처리 자체의 지연 제거 | Orin ICMP 평균 5.47→1.73ms |
+| 5 | **Wi-Fi → 이더넷 직결로 물리 링크 교체** | 가장 지배적인 요인(물리 왕복 지연) 자체를 제거 | **가장 큰 기여**: 평균 ~3100us(Wi-Fi) → 1193us(유선) |
+| 6 | 점대점 링크에서 서버 쪽 `VSOMEIP_SD_FAST_START` 미적용 버그 수정 | 서버에서도 netlink 대기를 건너뛰도록 통일 | 직결 환경에서 "느려지는" 게 아니라 **SD가 영원히 시작되지 않던** 완전한 실패를 해결(필수) |
+| 7 | 측정 스크립트(`request_sd.sh`)의 평균 계산 버그 수정 | `grep` 패턴 오류로 평균값 자체가 깨지는 문제 수정 | 측정 신뢰도 확보 |
+
+항목 1~3·6은 SOME/IP-SD 프로토콜 계층에만 작용하며, 서비스가 발견된 **이후의 실제
+통신(RPC, 이벤트 구독/발행, TCP 전송 등)에는 영향을 주지 않는다** — 자세한 범위 확인은
+[SD_LATENCY_REPORT.md 4절](SD_LATENCY_REPORT.md#4-이-변경들은-service-discovery-단계에만-영향을-준다)
+참고. 단, 2번(unicast-always)은 2대 점대점 토폴로지에 한정된 최적화이며, 3대 이상
+환경에서는 `cyclic_offer_delay`를 되돌려야 한다는 한계가 있다.
+
+### 2.5 최종 결과
+
+| | 값 |
+|---|---|
+| 평균 | **1193us (1.19ms)** |
+| p50 | 1188us |
+| p90 | 1274us |
+| 2ms 목표 통과율 | **99/100 (99%)** |
+
+### 2.6 재현 방법
+
+두 보드 각각에서 스크립트 하나씩만 실행하면 된다(SSH로 서로를 조종할 필요 없음).
+환경 구성(고정 IP, `unicast` 로컬 오버라이드)은
+[THOR_THOR_DIRECT_LINK_REPORT.md](THOR_THOR_DIRECT_LINK_REPORT.md) "1. 환경 구성" 참고.
+
+```bash
+./response_sd.sh   # 서버 역할 보드
+./request_sd.sh    # 클라이언트 역할 보드 - 매칭까지 걸린 시간을 10회씩, 10세트(총 100회) 출력
+```
+
+---
+
+## 3. 패킷 복구 시간
+
+### 3.1 정의
+
+통신 중 패킷(이벤트 또는 응답)이 **실제로 유실된 시점**부터, 그 유실된 정보를
+**다시 성공적으로 받을 때까지** 걸리는 시간. "복구 메커니즘"은 두 세대를 거쳤다 -
+TCP 자체의 재전송(아래 3.2.1)과, 최종적으로 전환한 요청/응답+timeout+재전송(아래
+3.2.2) - 서로 측정 구간의 정의가 다르므로 나눠서 설명한다.
+
+### 3.2 측정 구간
+
+#### 3.2.1 (1세대) TCP 자체 복구 — 연속 이벤트 스트림
+
+TCP는 순서를 보장하므로 유실 자체가 "빠진 메시지"로 보이지 않고, **수신 간격이
+비정상적으로 길어지는 것**으로만 나타난다. 그래서 "유실이 일어난 참 시점"은 직접
+보이지 않고 계산해야 한다:
+
+```
+gap_us = 이번 메시지 도착 시각 - 직전 메시지 도착 시각
+유실이 일어난 참 시점 = 직전 메시지 도착 시각 + baseline_us()   (= gap_us가 0이었다면 도착했어야 할 시각)
+
+IF gap_us > threshold(기본 3.0) × baseline_us():
+    복구 시간 = gap_us - baseline_us()     ← "참 시점"부터 "다시 받은 시점"까지, 정확히 그 값
+```
+
+`baseline_us()`는 최근 20개 "정상" 간격의 중앙값으로 자기보정된다. 와이어 레벨
+교차검증(`tcp-recovery/analyze_recovery.py`)은 서버의 `tcpdump` 캡처 하나로, 두 보드의
+시계를 맞출 필요 없이 같은 값을 유도한다(편도 지연이 빼기 연산에서 상쇄됨 — 원리는
+[TCP_RECOVERY_REPORT.md 1.1절](TCP_RECOVERY_REPORT.md#11-와이어-레벨-tcp-recoveryanalyze_recoverypy) 참고).
+
+#### 3.2.2 (2세대, 최종) 요청/응답 + timeout + 재전송
+
+연속 스트림이 아니라 **단일 요청/응답(UDP RPC)**: 클라이언트가 요청을 보내고, 정해진
+timeout 안에 응답이 없으면 그 요청이 유실됐다고 **확정**하고(통계적 판단이 아니라
+결정론적 timeout이므로 애매함이 없음) 직접 재전송한다.
+
+```
+"유실 시점부터 다시 받을 때까지" = timeout_us + (재전송 송신 → 응답 수신)
+                                      └─ 코드가 직접 재는 값 ─┘
+```
+
+최초 요청이 나간 시점을 "유실이 발생한 시점"으로 보는 것이 자연스러운 이유: 이 요청이
+실제로 유실됐기 때문에 timeout이 발생했고, 재전송이 나간 것이다.
+
+### 3.3 Baseline
+
+| | 값 |
+|---|---|
+| **Baseline (최적화 전, Orin, Wi-Fi/스위치, TCP 자체 복구 기준)** | **애플리케이션 레벨 평균 9.7ms** / 와이어 레벨 3.46ms |
+
+### 3.4 무엇을 바꿨고, 얼마나 기여했는가
+
+#### 1단계 — TCP 자체 복구 최적화 (측정·환경 레벨)
+
+| # | 변경 | 설명 | 기여(실측) |
+|---|---|---|---|
+| 1 | 유실 주입 방식 재설계 | `iptables OUTPUT DROP`(송신 실패로 처리돼 재전송 타이머가 안 탐) 대신, 더미 인터페이스로의 정책 라우팅으로 실제 선로 유실을 흉내냄 | 이전 방식은 측정 자체가 성립하지 않았음(필수 전제조건) |
+| 2 | 커널 TCP 튜닝(`rto_min=1ms`, `tcp_reordering=1`) | 재전송 판단까지 걸리는 타이머 하한을 낮춤 | Wi-Fi 기준 평균 6.51→3.46ms |
+| 3 | **Wi-Fi → 이더넷 직결** | 가장 지배적인 요인(물리 왕복 지연) 제거 | 와이어 레벨 중앙값 1.64ms→**0.57ms** |
+| 4 | 이벤트 발행 주기 `--cycle 5`→`--cycle 1` | 복구 감지가 더 촘촘해짐(간격이 짧아져 임계값 초과까지 걸리는 절대 시간도 줄어듦) | 애플리케이션 레벨 평균 7.4~7.8ms→**2.7ms** |
+| 5 | 자기보정 baseline 도입 | 고정 `cycle×1000` 가정을 폐기하고 실측 간격으로 교체 | `--cycle` 불일치로 유실을 통째로 못 잡던 문제(2743건 중 0건 탐지) 해결 |
+| 6 | baseline 오염 방지(burst 구간 배제 + circuit breaker) | 복구 직후 근접-0 간격들이 평소 간격 계산을 오염시키는 문제 차단 | 오탐률 94%→정상 수준(2~3%) |
+| 7~9 | 실시간 wire 표시, 종료 조건 통일, `xt_u32` 부재 자동 폴백 | 측정 도구 자체의 정확도·재현성 개선 | 레이스 컨디션·최신 커널(Orin) 유실 주입 실패 해결 |
+| 10 | GRO off / IRQ affinity / `chrt` RT / CPU pinning / `busy_poll` 전부 시도 | 커널 재빌드 없이 남은 레버를 모두 점검 | **전부 무효 또는 역효과** — "여기까지가 한계"라는 결론의 근거 |
+
+**1단계 결과**: 와이어 레벨은 목표를 완전히 통과(0.55~0.56ms, 100% ≤2ms)했지만,
+애플리케이션(체감) 레벨은 **2.7~2.9ms로 2ms 벽을 넘지 못했다** — `CONFIG_HZ=250`
+(4ms 커널 틱)에 묶인 것으로 강하게 추정되며, 커널 재빌드 없이 시도할 수 있는 모든
+레버(위 10번)를 소진한 뒤에도 남은 구간이다.
+
+#### 2단계 — 근본 재검토: "무엇이 진짜 병목인가" → 설계 전환 (최종 해법)
+
+| # | 변경 | 설명 | 기여(실측) |
+|---|---|---|---|
+| 11 | **N-PDU 집계(`npdu-default-timings`) 기본값 발견 및 제거** | vsomeip가 설정하지 않으면 모든 송신 메시지를 2ms debounce + 최대 5ms retention으로 묶어서 보내는 내부 기본값이 있음(연속 스트림은 거의 영향 없지만, 산발적 요청/응답은 양쪽에서 이 비용을 거의 그대로 지불) — config에 전부 `0`으로 명시 | 산발적 UDP RPC 복구: **13.9ms → 307us** |
+| 12 | 하이브리드(TCP 스트림 + UDP 사이드채널) 시도 및 "정직한" 재측정 | 유실 "의심" 시점이 아니라 유실의 참 시점부터 재계산해보니, TCP-native와 사이드채널 둘 다 ~2.5~2.8ms로 동일 | **효과 없음으로 확인** — 연속 스트림의 "유실인지 지터인지"를 통계적으로 판단하는 데 필요한 안전 마진(~2ms) 자체가 병목이고, 복구 메커니즘을 바꿔도 이 마진은 줄지 않음 |
+| 13 | **설계를 "요청/응답 + timeout + 클라이언트 재전송"으로 전환** | 단일 요청/응답은 지터와 혼동할 연속 스트림이 없어 애매함 자체가 없음 → timeout을 안전 마진 없이 실측 RTT(~300~900us) 바로 위(1000us)로 설정 가능 | **13번이 실질적으로 목표를 달성한 지점** — 아래 3.5 참고 |
+
+**핵심 통찰**: 1~10단계까지 손댄 것은 전부 "복구 메커니즘 자체의 속도"였지만(이미
+충분히 빨랐음 - TCP-native든 UDP든 수백 us대), 실제 병목은 **"유실이 일어났다는 것을
+얼마나 빨리, 안전하게 확정할 수 있느냐"**였다. 연속 스트림은 그 확정에 수 ms의 통계적
+마진이 필요하고, 단일 요청/응답은 필요 없다 — 그래서 메커니즘을 아무리 최적화해도
+안 되던 것이, 판단 구조 자체를 바꾸자 바로 풀렸다.
+
+### 3.5 최종 결과
+
+Thor↔Thor 직결 링크, 1-in-8 유실 주입, `--timeout-us 1000` 기준:
+
+| n | 재전송→응답 | **유실 시점부터 (헤드라인)** | ≤2ms |
+|---|---|---|---|
+| 20 | mean 335us | **mean 1335us, p90 1520us, max 1912us** | **100%** |
+| 50(재확인) | mean 449us | **mean 1449us, p90 1518us, max 1969us** | **100%** |
+
+재전송 포기(5회 재시도 모두 실패) 0건. TCP 자체 복구는 애플리케이션 레벨에서
+2.7~2.9ms로 남아있지만, "유실 시점부터 다시 받을 때까지"라는 원래 목표는 이
+요청/응답+재전송 설계로 **커널 재빌드 없이, 100% 안정적으로 2ms 이하 달성**됐다.
+
+### 3.6 재현 방법
+
+**TCP 자체 복구 (1세대, 와이어 0.55ms / 애플리케이션 2.7ms):**
+
+```bash
+./response_tcp.sh   # 서버 - sudo로 실행(유실 주입에 iptables/ip route 필요)
+./request_tcp.sh    # 클라이언트
+```
+
+세부 사용법·와이어 레벨 교차검증 방법은 [TCP_RECOVERY_REPORT.md](TCP_RECOVERY_REPORT.md)와
+[tcp-recovery/README.md](tcp-recovery/README.md) 참고.
+
+**최종 해법 (2세대, 요청/응답+timeout+재전송, 100% ≤2ms):**
+
+```bash
+sudo ./response_rpc_retry.sh <클라이언트 IP> [1/N 유실=8]   # 서버 - sudo 필요
+./request_rpc_retry.sh [주기ms=5] [timeout_us=1000] [최대재전송=5] [최소복구건수=10]  # 클라이언트
+```
+
+- timeout을 바꾸기 전에 `NO_DROP=1`로 유실 없이 평소 RTT부터 확인할 것, 로그 읽는 법,
+  실제 유실이 정말 일어났는지 `dmesg`/`tcpdump`로 확인하는 법까지 전부
+  [RPC_RETRY_REPORT.md](RPC_RETRY_REPORT.md)에 정리돼 있다.
+- 두 스크립트 모두 SSH로 서로를 조종할 필요 없이, 각자 자기 보드에서 하나씩만 실행하면
+  된다. 환경 구성은 SD와 동일하게
+  [THOR_THOR_DIRECT_LINK_REPORT.md](THOR_THOR_DIRECT_LINK_REPORT.md) 참고.
+
+### 3.7 이 변경들이 정상 통신에 악영향을 주지 않는다는 것
+
+- 유실 주입(`inject_loss.sh`)은 테스트 하네스 전용이며, 스크립트 종료 시 트랩으로
+  반드시 해제된다 — 유실이 주입되지 않는 평상시 경로에는 이 프로젝트가 건드린 코드가
+  전혀 개입하지 않는다.
+- 커널 TCP 튜닝(`rto_min`, `tcp_reordering`)은 "재전송이 필요한 상황"에서만 의미가
+  있고, 유실이 없는 정상 처리량에는 관여하지 않으며 재부팅 시 초기화되는 휘발성 값이다.
+- `npdu-default-timings`를 0으로 둔 것은 **이 테스트용 config에 한정**된 변경이다.
+  vsomeip를 더 폭넓게 쓰는 배포에서는, 메시지가 송신 소켓에 닿기 전 배치 윈도우가
+  사라지므로 작은 메시지를 아주 자주 보내는 워크로드라면 패킷 수가 늘어날 수 있다는
+  트레이드오프를 인지하고 적용해야 한다 — 산발적 요청/응답처럼 "자주 보내지 않는"
+  트래픽에는 이 트레이드오프가 거의 없다.
+- "요청/응답+timeout+재전송" 설계(13번)는 **새로 만든 별도 서비스/도구**(`*-rpc-retry`)이지
+  기존 TCP 이벤트 스트림 코드를 바꾼 것이 아니다 — 기존 서비스의 동작 방식을 전혀
+  바꾸지 않고, 2ms 목표를 만족하는 별도 구현으로 존재한다.
+
+자세한 근거는 [TCP_RECOVERY_REPORT.md 4절](TCP_RECOVERY_REPORT.md#4-이-변경들이-정상유실-없는-통신에-악영향을-주지-않는다는-것) 참고.
+
+---
+
+## 4. 공통 개발 환경
 
 **하드웨어**
 
-- **개발 보드**: NVIDIA Orin 2대
-- **CPU**: Armv8
-- **메모리**: 32GB
+- 초기: NVIDIA Orin 2대(Armv8, 32GB) — Wi-Fi/스위치 경유
+- 최종: NVIDIA AGX Thor 2대 — 이더넷 케이블 직결([THOR_THOR_DIRECT_LINK_REPORT.md](THOR_THOR_DIRECT_LINK_REPORT.md))
 
 **소프트웨어**
 
-- **운영체제**: Ubuntu 20.04
-- **커널 버전**: Linux Kernel 5.10.104-tegra (일부 설정은 제외되어있음)
+- 운영체제: Ubuntu 20.04 / Linux Kernel 5.10.104-tegra(Orin), Thor는 해당 보드 기본 커널
+  (일부 설정 제외, 커널 재빌드는 하지 않음)
 
-**네트워크 구성**
+**패킷 손실 환경**
 
-- **물리적 네트워크 환경**: NVIDIA Orin 2대를 이더넷 케이블로 다이렉트로 연결하여 통신 테스트.
-- **통신 프로토콜**: SD는 UDP의 멀티캐스트, TCP Packet Recovery는 TCP 통신 가정
-- **패킷 손실 환경**: 2대가 유선으로 바로 연결되어 있기에 일반적인 상황에서 패킷이 유실될 가능성은 없음. 그렇기에 `tc`, `iptables` 커맨드를 활용하여 인위적으로 손실 유발. 타겟 보드에선 `tc` 커맨드 사용 불가로 `iptables` 커맨드 사용
+2대가 유선으로 직결되어 있어 일반적인 상황에서 패킷이 유실될 가능성은 없다. 그래서
+`tcp-recovery/inject_loss.sh`(더미 인터페이스로의 정책 라우팅, TCP/UDP 공용)로 인위적으로
+손실을 유발한다 — 과거 `iptables OUTPUT DROP`/`tc` 방식이 왜 측정을 왜곡시켰는지는
+[tcp-recovery/README.md](tcp-recovery/README.md) "왜 새로 만들었나" 참고.
 
-```bash
-sudo iptables -D INPUT -i wlo1 -m statistic --mode random --probability 0.1 -j DROP # 10% 확률로 해당 컴퓨터로 들어오는 패킷의 10%를 유실
-```
+**빌드**
 
-
-### 빌드 커맨드
-
-vSomeIP 설치는 다 되었다는 가정 하에 (https://github.com/COVESA/vsomeip)
-
-```
-make examples
-```
-
-실행으로 examples 내 코드만 빌드 가능
-
-### 테스트 방법
-
-**SD 지연 시간**
-
-1. 한 대의 보드에서 `./response_sd.sh` 스크립트 실행 -> SomeIP 프로토콜의 FindService 호출 시 응답할 수 있게 대기 (이하 server)
-2. 다른 보드에서 `./request_sd.sh` 스크립트 실행으로 FindService 송신 (이하 client)
-3. server가 client가 전송한 find를 멀티캐스트로 받고 있다가 이를 체크 후 application name, service id, instance id가 일치할 시 응답, 이 때까지 걸린 시간이 SD 지연 시간
-4. SD 지연 시간을 10번 측정 한 후 이 평균 값을 1회의 시간으로 측정, 10회의 측정값이 기준값을 통과하는지 최종 확인 (총 100회 요청 테스트)
+vSomeIP 설치가 되어 있다는 가정 하에([설치 가이드](https://github.com/COVESA/vsomeip)):
 
 ```bash
-./response_sd.sh # 오른쪽 orin
-./request_sd.sh # 왼쪽 orin
+cmake --build build --target examples
 ```
 
+**config 공통 항목**
 
-**TCP 패킷 복구 시간**
+- 최상단 `unicast`: vSomeIP를 실행하는 보드 자신의 IP(로컬 전용, 커밋하지 않음)
+- `cyclic_offer_delay`: SD에서 서버가 멀티캐스트로 자신을 알리는 주기 — 벤치마크 중
+  "재광고"가 측정을 방해하지 않도록 매우 길게(수백만 ms) 설정
+- `request_response_delay`: 요청 수신 후 응답까지 강제로 주는 지연 — `0`
+- `npdu-default-timings`: 작은 메시지를 모아서 보내는 내부 배치(N-PDU 집계)의 기본
+  debounce/retention을 `0`으로 — 산발적 요청/응답에 적용하지 않으면 최대 ~7-8ms씩
+  per-side로 더해진다(3.4절 11번 참고)
+- `eventgroups`: SOME/IP 스펙상 필요하지만 본 프로젝트에서는 사용하지 않음
 
-> 2026-09 기준, 아래의 수동 `iptables`+Wireshark 방식은 [tcp-recovery/](tcp-recovery/)의 도구로
-> 대체됐다. 기존 방식의 `-D`(삭제 옵션이라 유실이 주입되지 않음)·`OUTPUT` DROP(TCP가 "안 보낸 것"으로
-> 처리해 재전송 타이머를 타지 않음)·캡처 위치 문제를 [tcp-recovery/README.md](tcp-recovery/README.md)
-> "왜 새로 만들었나"에 정리해 뒀다. 아래는 과거 기록이자, 지금도 유효한 절차의 개요.
+**유의사항**
 
-SD 측정(`response_sd.sh`/`request_sd.sh`)과 같은 방식으로, 두 보드에서 스크립트 하나씩만 실행한다 - 둘
-사이에 SSH가 필요 없다. `request_tcp.sh` 쪽 화면에 뜨는 `패킷 유실 복구 시간: Xus` 줄이 `request-sd.cpp`의
-"매칭까지 처리 시간"과 같은 방식으로 **클라이언트 자신이 직접 잰** 값이다.
-
-```bash
-./response_tcp.sh # 서버 - sudo로 실행, 유실 주입도 여기서 관리
-./request_tcp.sh  # 클라이언트
-```
-
-1. `./response_tcp.sh` 스크립트를 서버에서 sudo로 실행 → 이벤트 발행 시작, 유실 주입도 같이 관리
-2. 클라이언트에서 `./request_tcp.sh` 실행 → 구독 시작
-3. 패킷 손실이 발생 시 TCP 프로토콜 내에 내장된 로직으로 패킷 손실 복구 과정 진행
-4. 손실 후 수신 간격이 정상 주기(최근 수신 간격에서 자동으로 계산됨)의 3배(기본값)를 넘으면 클라이언트가
-   직접 "패킷 유실 복구 시간"을 로그로 출력
-5. 10건(기본값) 감지하면 클라이언트가 스스로 멈추고 `총 수신 N건 중 M건 유실, 평균 복구 시간 Xus`를 출력
-
-서버 쪽 tcpdump 캡처 하나로 두 보드의 시계 동기화 없이 와이어 레벨로 교차검증하려면
-`tcp-recovery/run_experiment.sh`(SSH 자동화) 또는 `tcp-recovery/inject_loss.sh`+`analyze_recovery.py`를
-직접 조합해서 쓴다 - 두 방법의 차이와 사용법은 tcp-recovery/README.md 참고.
-
-### 테스트 결과
-
-| **지표**                  | **최적화 전** | **1차 최적화** | **2차 최적화 (Wi-Fi, 2026-09)** | **3차 최적화 (유선 직결, 2026-09)** |
-|--------------------------|---------------|---------------|---------------------------|---------------------------------|
-| 서비스 디스커버리 시간   | 평균 20ms    | 평균 4ms      | 평균 2.5~3ms (Wi-Fi 링크가 병목) | **중앙값 1.19ms** (100회 중 99회 1.5ms 이내) |
-| TCP 패킷 복구 시간       | 평균 10ms    | 평균 4ms      | 평균 3.46ms(와이어) / 9.7ms(체감) | **평균 0.58ms**(와이어, `--cycle 1`) / 2.7ms(체감) |
-
-3차는 Thor↔Orin을 스위치 대신 이더넷 케이블로 직결하고, 발행 주기를 `--cycle 5`에서 `--cycle 1`로
-바꾼 뒤의 수치 - 와이어 레벨은 이미 목표(2ms)를 여유 있게 통과한다(개별 건 100% ≤2ms, Thor/Orin 어느
-쪽이 client여도 동일). 체감(애플리케이션 레벨) 값은 여전히 와이어 레벨보다 높은데 - 커널 재빌드 없이
-줄일 수 있는지 다시 검토(GRO/IRQ affinity/real-time 스케줄링 다 시도)했지만 효과가 없었고,
-`CONFIG_HZ=250`(4ms 커널 틱)이 가장 유력한 원인으로 남아있다 - 왜 그런지, 두 지표가 왜 따로 있는지는
-[CHANGES_THOR.md](CHANGES_THOR.md) "Live wire-level display, cross-board hardening, and a real
-self-calibration bug"와 [tcp-recovery/README.md](tcp-recovery/README.md) "결과: 실측값" 참고. 2차(Wi-Fi)
-수치는 비교 기준으로 남겨뒀다. 1차 수치("평균 4ms")는 측정 방법의 결함(`OUTPUT` DROP이 실제로는 선로
-유실을 흉내내지 못하는 문제 등) 때문에 이후 수치와 직접 비교하기는 어렵다.
-
-### config
-
-- 최상단 `unicast`: vSomeIp 실행하는 host의 ip 입력
-- `cyclic_offer_delay`: SD과정에서 server가 멀티캐스트를 통해 본인의 존재를 알리는 과정을 OfferService라고 함. 이 offer를 `repetitions_max`만큼 반복 후 다시 이를 반복하는데 이 주기를 의미
-  - 본 프로젝트 테스트 과정은 offer를 받는 게 아닌 FindService에 대한 응답으로 처리가 되는 시간을 보는 것이 우선. 그렇기에 이 주기를 최대한 길게 하여 OfferService 과정이 일어나지 않게 함
-- `request_response_delay`: 한 번 request가 왔을 시 response 하기 전까지 줄 delay를 의미. 이 값으 0으로 만듦으로써 2024년 1차 테스트 통과
-- `eventgroups`: SOME/IP에서는 필요하지만 본 프로젝트에서는 사용하지 않음
-
-### 유의사항
-
-- ~~`iptables`를 통한 패킷 로스는 소프트웨어 레벨로 구현이 되어있지만 wireshark는 하드웨어 레벨에서 패킷을 관찰하기에 둘 간의 패킷 불일치 발생~~ →
-  `tcp-recovery/inject_loss.sh`는 `iptables OUTPUT DROP`이 아니라 dummy 인터페이스로의 정책 라우팅을 쓴다(자세한 이유는
-  [tcp-recovery/README.md](tcp-recovery/README.md) 참고). 캡처와 분석을 서버 쪽 tcpdump 하나로 통일해서 두 장비 간
-  불일치 문제 자체를 없앴다.
-- 데스크탑에서 잘 돌아가던 코드가 orin에서 테스트할 시 안 되던 케이스가 있었기에 script에 보면 코드, config에 일관성이 없는 문제가 있음
-  - SD 과정 없이 IP를 고정으로 TCP 통신하는 config, 별도의 tcp application 코드가 동작하지 않음 등
-  - (2026-09) `config/vsomeip-tcp-client.json`·`vsomeip-tcp-service.json`의 `unicast`가 이 보드들과 무관한 옛 IP
-    (`192.168.196.27`/`.103`)로 남아있던 것도 이 문제의 사례 - SD 설정과 같은 방식으로 Thor의 실제 IP로 맞춰뒀다.
-    Orin에서 쓸 때는 SD 설정과 마찬가지로 자기 IP를 로컬(비커밋) 변경으로 덮어써야 한다 ([CHANGES_THOR.md](CHANGES_THOR.md)
-    "Per-device unicast" 참고).
-
-
----
-## 3. 향후 과제
-
-- (2026-09 갱신) TCP 패킷 복구는 무엇을 바꿔야 하는지 찾았다 - `tcp-recovery/` 참고. 와이어 레벨은 이미
-  목표를 통과했고(552-560us, 양방향), 남은 건 체감(애플리케이션) 레벨뿐인데 커널 재빌드 없이 되는
-  방법은 다 시도해봤다(2026-09-15, GRO/IRQ affinity/real-time 스케줄링) - `CONFIG_HZ=250`(재빌드 시
-  이론상 ~1.8ms 추정)이 유일하게 남은, 그러나 손대지 않은 후보다. 자세한 분해는
-  [tcp-recovery/README.md](tcp-recovery/README.md) "2ms까지 남은 구간" 참고.
-- (2026-09-15 발견, 미조사) Thor가 client일 때가 Orin이 client일 때보다 체감 복구 시간이 뚜렷하게 더
-  느리고 변동폭도 크다(p90 11ms vs 2.9ms) - 둘 다 동일한 전력/클럭 설정인데도 이렇다. 원인 미파악,
-  [CHANGES_THOR.md](CHANGES_THOR.md) "Next steps" 참고.
-- config를 통한 시간 단축, TCP 프로토콜 내에서 할 수 있는 테스트는 다 해봤기에 SOME/IP 내용 이해 후 SomeIP를 구현한 vSomeIP 코드 내에서  C++ 코드 최적화 과정 진행 필요
-
+- 데스크탑에서 동작하던 코드가 실제 보드에서 안 되는 케이스가 있어, 스크립트·config
+  간에 완전한 일관성은 없다(SD 없이 고정 IP로 TCP 통신하는 config 등).
+- 보드를 바꿔 쓸 때는 각 `*-client.json`/`*-service.json`의 `unicast`를 그 보드의 실제
+  IP로 로컬에서(비커밋) 덮어써야 한다.
 
 ---
 
-## 4. 참고 자료
+## 5. 향후 과제
 
-- [SOME/IP 프로토콜 명세서](https://some-ip.com/standards.shtml)
-  - 이 중 SD 관련된 내용 위주로 살펴보기
+- 패킷 복구의 TCP-native 애플리케이션 레벨(2.7~2.9ms)은 `CONFIG_HZ=250`(4ms 커널 틱)에
+  묶인 것으로 강하게 추정되며, 커널 재빌드 없이는 더 줄이기 어렵다 — 재빌드 시
+  이론상 ~1.8ms까지 내려갈 것으로 추정([tcp-recovery/README.md](tcp-recovery/README.md)
+  "2ms까지 남은 구간" 참고). "유실 시점부터 다시 받을 때까지"라는 목표 자체는
+  요청/응답+재전송 설계(3.4절 13번)로 이미 달성했으므로, 이 항목은 TCP 이벤트 스트림을
+  그대로 써야 하는 경우에만 남은 과제다.
+- Thor가 client일 때가 Orin이 client일 때보다 TCP 체감 복구 시간이 더 느리고 변동폭도
+  크다(p90 11ms vs 2.9ms, 동일 전력/클럭 설정에도) — 원인 미파악
+  ([CHANGES_THOR.md](CHANGES_THOR.md) "Next steps" 참고).
+- `npdu-default-timings` 기본값 이슈는 이 프로젝트의 범위를 넘어 **vsomeip를 산발적
+  요청/응답 위주로 쓰는 다른 배포 전반**에 적용될 수 있는 일반적인 발견이다 — 다른
+  서비스들도 이 기본값에 영향받는지 점검해볼 가치가 있다.
+
+---
+
+## 6. 참고 자료
+
+- [SOME/IP 프로토콜 명세서](https://some-ip.com/standards.shtml) — 이 중 SD 관련 내용 위주로
 - [차량 내에서 TCP](https://some-ip.com/papers/2022-11_IEEE-Techday_TCP_and_Automotive_Ethernet.pdf)
-  - 어떻게 차량 환경에서 TCP 프로토콜을 최적화 할 지에 대한 가이드
-- 기타 웹 자료
-  - https://watchout31337.tistory.com/444
-  
+- https://watchout31337.tistory.com/444
 
 ---
 
