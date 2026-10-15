@@ -881,3 +881,81 @@ Added the same `npdu-default-timings` override to `config/vsomeip-udp-service.js
 `config/vsomeip-udp-client.json` (the plain example configs) to keep this demonstration
 reproducible - not because this particular example is a project deliverable, but as
 standing evidence of how broadly the default affects even vsomeip's own stock tooling.
+
+## Hybrid (TCP stream + UDP side-channel) and RPC timeout+retry - where "effective" recovery actually comes from (2026-10-15)
+
+Prompted by a question worth taking seriously: is TCP a hard requirement, or could the
+event stream stay on TCP while loss recovery itself goes through the fast UDP mechanism
+proven above? Two designs tried, in order - the first taught an important lesson the
+second one then acted on.
+
+**Attempt 1 - `examples/{request,response}-hybrid-recovery.cpp`.** TCP event stream
+unchanged (same self-calibrating baseline/circuit breaker as `request-tcp-recovery.cpp`),
+plus a proactive watchdog thread that polls and, once `threshold × baseline` has elapsed
+with nothing arriving, fires the same fast UDP recovery RPC used above - *before* TCP's
+own retransmission lands, not after (request-tcp-recovery.cpp's detection is retrospective
+and can't drive a parallel recovery attempt at all: by the time it notices a gap, TCP has
+already delivered the data). Measured both, from the watchdog's own firing point: UDP
+hybrid 382us, native TCP 620-632us - UDP faster, but not dramatically.
+
+**The reason, caught by asking exactly the right follow-up question: that comparison starts
+the clock too late.** The watchdog doesn't fire until `threshold × baseline` (≈3×1060 ≈
+3180us) has already elapsed since the *actual* loss (the expected-but-missed arrival,
+`last_event + 1×baseline` - what request-tcp-recovery.cpp's own "복구 시간" has used as its
+reference point all along). Re-anchored to that real loss moment
+(`stall_fire_time + measured_value - baseline`): UDP hybrid **2527us**, native TCP
+**2783us** - both back in the same 2.6-2.8ms range this whole investigation has been
+chasing, because the dominant cost by this accounting is `(threshold-1) × baseline ≈ 2120us`
+of *detection margin*, not either recovery mechanism's own speed. The margin exists only
+because a continuous cyclic stream gives no way to tell "real loss" from "this cycle's
+jitter" except statistically, and 3× was chosen (and verified, in the original TCP work) to
+keep false positives at zero - there is no slack left to recover by swapping the recovery
+mechanism once that margin has already been paid.
+
+**Attempt 2 - `examples/{request,response}-rpc-retry.cpp}`, built on the follow-up
+insight: a single outstanding request/response has no such ambiguity.** No event stream,
+no cyclic baseline at all - one request, waiting on one specific response. A timeout
+firing on a *specific, individual, already-sent* request is not competing with "is this
+normal jitter" the way a cyclic stream's inter-arrival gap is, so it can be set close to
+the link's actual RTT (measured standalone, npdu-fixed: mean 926us, max 1163us - see the
+section above) instead of several baseline multiples. On timeout, the client itself
+resends the request - no kernel retransmission, no statistical judgement, just "nothing
+back in time, try again" - and the time from that resend to the answer finally arriving is
+the number that matters.
+
+Swept `--timeout-us` downward, loss injected on the RPC's own UDP port
+(`PROTO=udp PORT=30518`, reusing the `inject_loss.sh` support added earlier this session),
+same direct Thor-Thor link as everything else above - "유실 시점부터" (from the original,
+lost attempt - the honest reference point, same idea as above) means `timeout_us +
+(resend→response)`:
+
+| `--timeout-us` | n | resend→response | **from the original attempt** | ≤2ms |
+|---|---|---|---|---|
+| 2000 | 20 | mean 435us, max 868us | mean 2435us, p50 2465us, max 2868us | 0% |
+| 1200 | 20 | mean 398us, max 853us | mean 1598us, p50 1661us, p90 1834us, max 2053us | 95% |
+| **1000** | 20 | mean 335us, max 912us | **mean 1335us, p50 1434us, p90 1520us, max 1912us** | **100%** |
+| **1000** | 50 (repeat) | mean 449us, max 969us | **mean 1449us, p50 1454us, p90 1518us, max 1969us** | **100%** |
+
+Zero give-ups (exceeding `--max-retries`, default 5) across any run - every loss recovered
+on the first retry, consistent with a 1-in-8 injection rate making a second consecutive
+loss on the same logical request rare. **This is the first version in this entire
+investigation - TCP-native, UDP-only, or hybrid - that gets the full "유실 시점부터 다시
+받을 때까지" number under 2ms, reliably (100% at n=50), without touching the kernel.**
+
+What made the difference, stated plainly: the bottleneck this whole session kept running
+into was never really "which mechanism recovers the data" - wire-level TCP, pure UDP, and
+this RPC's own resend-to-response leg are all in the same few-hundred-microsecond class
+once `npdu-default-timings` is fixed. It was always **how long it takes to safely decide a
+loss happened in the first place**. A cyclic stream (TCP or UDP) forces that decision to be
+statistical, with a margin sized to the stream's own jitter - multiple milliseconds here. A
+single request/response has no stream to be confused with, so the exact same "timeout, then
+retry" idea that cost ~2ms of unavoidable margin on a cyclic stream costs as little as the
+link's own RTT once there is nothing cyclic to protect against.
+
+Reused `SAMPLE_SERVICE_ID`/`SAMPLE_METHOD_ID` but needed a fresh instance id
+(`RPC_RETRY_INSTANCE_ID`, `examples/sample-ids.hpp`) rather than the already-used
+`SAMPLE_INSTANCE_ID` - reusing it collided with `response-hybrid-recovery.cpp`'s own offer
+of the same service/instance (reliable, different port) from the preceding test in the same
+session: vsomeip's SD layer logged "Remote offer type changed" and flapped availability,
+and zero requests were ever actually sent. A fresh instance id sidesteps the whole class of
+bug instead of relying on tests never overlapping within a session's SD/routing state.

@@ -1,0 +1,69 @@
+{
+    "unicast" : "10.10.10.1",
+    "logging" :
+    {
+        "level" : "debug",
+        "console" : "true",
+        "file" : { "enable" : "false", "path" : "/tmp/vsomeip.log" },
+        "dlt" : "false"
+    },
+    "applications" :
+    [
+        {
+            "name" : "service-sample",
+            "id" : "0x1277"
+        }
+    ],
+    "services" :
+    [
+        {
+            "service" : "0x1234",
+            "instance" : "0x5678",
+            "reliable" : { "port" : "30516", "enable-magic-cookies" : "false" },
+            "unreliable" : "30509",
+            "events" :
+            [
+                {
+                    "event" : "0x8778",
+                    "is_field" : "true",
+                    "is_reliable" : "true",
+                    "update-cycle" : "0"
+                }
+            ],
+            "eventgroups" :
+            [
+                {
+                    "eventgroup" : "0x4465",
+                    "events" : [ "0x8778" ]
+                }
+            ]
+        },
+        {
+            "service" : "0x1234",
+            "instance" : "0x5679",
+            "unreliable" : "30517"
+        }
+    ],
+    "npdu-default-timings" :
+    {
+        "debounce-time-request" : "0",
+        "debounce-time-response" : "0",
+        "max-retention-time-request" : "0",
+        "max-retention-time-response" : "0"
+    },
+    "routing" : "service-sample",
+    "service-discovery" :
+    {
+        "enable" : "true",
+        "multicast" : "224.244.224.245",
+        "port" : "30490",
+        "protocol" : "udp",
+        "initial_delay_min" : "0",
+        "initial_delay_max" : "0",
+        "repetitions_base_delay" : "1",
+        "repetitions_max" : "1",
+        "ttl" : "3",
+        "cyclic_offer_delay" : "1000000",
+        "request_response_delay" : "0"
+    }
+}

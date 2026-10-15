@@ -12,6 +12,10 @@ set(EXAMPLE_CONFIG_FILES
     "../config/vsomeip-udp-service.json"
     "../config/vsomeip-udp-recovery-client.json"
     "../config/vsomeip-udp-recovery-service.json"
+    "../config/vsomeip-hybrid-recovery-client.json"
+    "../config/vsomeip-hybrid-recovery-service.json"
+    "../config/vsomeip-rpc-retry-client.json"
+    "../config/vsomeip-rpc-retry-service.json"
 )
 
 # Examples
@@ -39,16 +43,28 @@ target_link_libraries(request-udp-recovery ${VSOMEIP_NAME} ${Boost_LIBRARIES} ${
 add_executable(response-udp-recovery response-udp-recovery.cpp ${EXAMPLE_CONFIG_FILES})
 target_link_libraries(response-udp-recovery ${VSOMEIP_NAME} ${Boost_LIBRARIES} ${DL_LIBRARY})
 
+add_executable(request-hybrid-recovery request-hybrid-recovery.cpp ${EXAMPLE_CONFIG_FILES})
+target_link_libraries(request-hybrid-recovery ${VSOMEIP_NAME} ${Boost_LIBRARIES} ${DL_LIBRARY})
+
+add_executable(response-hybrid-recovery response-hybrid-recovery.cpp ${EXAMPLE_CONFIG_FILES})
+target_link_libraries(response-hybrid-recovery ${VSOMEIP_NAME} ${Boost_LIBRARIES} ${DL_LIBRARY})
+
+add_executable(request-rpc-retry request-rpc-retry.cpp ${EXAMPLE_CONFIG_FILES})
+target_link_libraries(request-rpc-retry ${VSOMEIP_NAME} ${Boost_LIBRARIES} ${DL_LIBRARY})
+
+add_executable(response-rpc-retry response-rpc-retry.cpp ${EXAMPLE_CONFIG_FILES})
+target_link_libraries(response-rpc-retry ${VSOMEIP_NAME} ${Boost_LIBRARIES} ${DL_LIBRARY})
+
 add_executable(subscribe-sample subscribe-sample.cpp ${EXAMPLE_CONFIG_FILES})
 target_link_libraries(subscribe-sample ${VSOMEIP_NAME} ${Boost_LIBRARIES} ${DL_LIBRARY})
 
 add_executable(notify-sample notify-sample.cpp ${EXAMPLE_CONFIG_FILES})
 target_link_libraries(notify-sample ${VSOMEIP_NAME} ${Boost_LIBRARIES} ${DL_LIBRARY})
 
-add_dependencies(examples request-sample response-sample subscribe-sample notify-sample request-sd response-sd request-tcp-recovery response-tcp-recovery request-udp-recovery response-udp-recovery)
+add_dependencies(examples request-sample response-sample subscribe-sample notify-sample request-sd response-sd request-tcp-recovery response-tcp-recovery request-udp-recovery response-udp-recovery request-hybrid-recovery response-hybrid-recovery request-rpc-retry response-rpc-retry)
 
 install (
-    TARGETS request-sample response-sample subscribe-sample notify-sample request-sd response-sd request-tcp-recovery response-tcp-recovery request-udp-recovery response-udp-recovery
+    TARGETS request-sample response-sample subscribe-sample notify-sample request-sd response-sd request-tcp-recovery response-tcp-recovery request-udp-recovery response-udp-recovery request-hybrid-recovery response-hybrid-recovery request-rpc-retry response-rpc-retry
     RUNTIME DESTINATION "${INSTALL_BIN_DIR}" COMPONENT bin
 )
 

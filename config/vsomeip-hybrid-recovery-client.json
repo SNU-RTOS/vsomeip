@@ -1,0 +1,48 @@
+{
+    "unicast" : "10.10.10.1",
+    "netmask" : "255.255.255.0",
+    "logging" :
+    {
+        "level" : "info",
+        "console" : "true",
+        "file" : { "enable" : "true", "path" : "/var/log/vsomeip.log" },
+        "dlt" : "true"
+    },
+    "applications" :
+    [
+        {
+            "name" : "client-sample",
+            "id" : "0x1343"
+        }
+    ],
+    "clients" :
+    [
+        {
+            "service" : "0x1234",
+            "instance" : "0x5678",
+            "reliable" : [ "41236" ]
+        }
+    ],
+    "npdu-default-timings" :
+    {
+        "debounce-time-request" : "0",
+        "debounce-time-response" : "0",
+        "max-retention-time-request" : "0",
+        "max-retention-time-response" : "0"
+    },
+    "routing" : "client-sample",
+    "service-discovery" :
+    {
+        "enable" : "true",
+        "multicast" : "224.244.224.245",
+        "port" : "30490",
+        "protocol" : "udp",
+        "initial_delay_min" : "0",
+        "initial_delay_max" : "0",
+        "repetitions_base_delay" : "1",
+        "repetitions_max" : "1",
+        "ttl" : "3",
+        "cyclic_offer_delay" : "20000000",
+        "request_response_delay" : "0"
+    }
+}

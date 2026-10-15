@@ -27,4 +27,15 @@
 // never also drops the recovery exchange it is supposed to be measuring.
 #define RECOVERY_RPC_INSTANCE_ID 0x5679
 
+// response-rpc-retry.cpp's own instance - deliberately NOT SAMPLE_INSTANCE_ID
+// (0x5678): that one is also offered, differently (reliable vs unreliable,
+// different port), by response-tcp-recovery.cpp/response-hybrid-recovery.cpp.
+// Reusing it here caused vsomeip's SD layer to see the "same" service/instance
+// change offer type between test runs and get confused (reproduced live:
+// "process_offerservice_serviceentry: Remote offer type changed", flapping
+// availability, zero requests ever actually sent) - a fresh instance id avoids
+// the whole class of bug instead of relying on both sides never overlapping in
+// time.
+#define RPC_RETRY_INSTANCE_ID 0x567a
+
 #endif // VSOMEIP_EXAMPLES_SAMPLE_IDS_HPP
