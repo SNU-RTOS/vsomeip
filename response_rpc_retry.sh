@@ -7,6 +7,8 @@
 # 서비스의 UDP 포트(기본 30518)에 주입된다(서버->클라이언트 응답 쪽).
 #
 # 사용법: sudo ./response_rpc_retry.sh <클라이언트 IP> [1/N 유실=8]
+#   --timeout-us를 고를 때 참고할 "평소 RTT"가 필요하면, 유실 주입 없이 먼저 재볼 것:
+#   NO_DROP=1 sudo ./response_rpc_retry.sh <클라이언트 IP>
 set -e
 
 [ "$(id -u)" -eq 0 ] || { echo "sudo로 실행하세요 (유실 주입에 iptables/ip route가 필요)" >&2; exit 1; }
@@ -14,6 +16,7 @@ CLIENT_IP=$1
 [ -n "$CLIENT_IP" ] || { echo "usage: sudo $0 <클라이언트 IP> [1/N 유실=8]" >&2; exit 1; }
 EVERY="${2:-8}"
 PORT="${PORT:-30518}"
+NO_DROP="${NO_DROP:-0}"
 
 SERVER_IP=$(python3 -c "import json; print(json.load(open('config/vsomeip-rpc-retry-service.json'))['unicast'])")
 [ "$CLIENT_IP" != "$SERVER_IP" ] || {
@@ -24,11 +27,14 @@ SERVER_IP=$(python3 -c "import json; print(json.load(open('config/vsomeip-rpc-re
 pgrep -f build/examples/response-rpc-retry >/dev/null 2>&1 || rm -f /tmp/vsomeip-0 /tmp/vsomeip.lck 2>/dev/null
 
 cleanup() {
-    PROTO=udp PORT="$PORT" EVERY="$EVERY" ./tcp-recovery/inject_loss.sh stop "$SERVER_IP" "$CLIENT_IP" >/dev/null 2>&1 || true
+    [ "$NO_DROP" = 1 ] || \
+        PROTO=udp PORT="$PORT" EVERY="$EVERY" ./tcp-recovery/inject_loss.sh stop "$SERVER_IP" "$CLIENT_IP" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-PROTO=udp PORT="$PORT" EVERY="$EVERY" ./tcp-recovery/inject_loss.sh start "$SERVER_IP" "$CLIENT_IP"
+if [ "$NO_DROP" != 1 ]; then
+    PROTO=udp PORT="$PORT" EVERY="$EVERY" ./tcp-recovery/inject_loss.sh start "$SERVER_IP" "$CLIENT_IP"
+fi
 
 export LD_LIBRARY_PATH="build:$LD_LIBRARY_PATH"
 export VSOMEIP_CONFIGURATION="config/vsomeip-rpc-retry-service.json"
